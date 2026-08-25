@@ -38,7 +38,7 @@ android {
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
-            // SDK cmake/3.22.1 的 bin/ 已替换为 arm64 原生 cmake 4.1.1 + ninja 1.13.1
+            // t14：RV2IDE usr/bin/cmake 环境失效 → SDK 3.22.1 重新替换为 4.1.2 内容（见构建说明）
             version = "3.22.1"
         }
     }

@@ -128,12 +128,15 @@ object GumJsBridge {
      *   `Java.use(cls)`=ClassWrapper（per-cls 缓存、不预查类——MISS 由 HookRouter 注册时路由）；
      *   `clazz.method.implementation = fn|null`（fn 返回 undefined=观察语义自动 proceed；
      *   非 undefined=替换返回；null=移除；重复赋值=重注册）；
-     *   tag 约定=`<cls>#<method>`；overload('V') 精确选择=B2（此处不支持）。
+     *   tag 约定=`<cls>#<method>`（overload 精确选择时为 `<cls>#<method>#<sigs 逗号串>`）；
+     *   `clazz.method.overload('I','java.lang.String').implementation = fn|null`（B2 精确选择；
+     *   缺省不调 overload()=挂全部 overload，现状零改动）；
      * - 回复通道：`rpc.exports.__lspHookReply(id, argsJson)` 返回 `JSON.stringify({over,r})`（async fn
      *   返回 Promise 亦支持——dispatcher 等待后 reply）；其余由 message-dispatcher 自动发标准 frida:rpc
      *   reply（`["frida:rpc",id,"ok",value]`）；抛异常 → 自动 error reply → cpp 按超时兜底 proceed。
-     * - this 桥（t9，cap 裁定更新：不再抛错）：`this.<method>(...)`（仅 ClassWrapper 已物化方法名，
-     *   判定=__lspClassMeta[cls].methods）→ send `{t:"lsp.rpc_inner", id:当前rpc id}` + 返回 Promise；
+     * - this 桥（t9+B2，cap 裁定更新：不再抛错）：`this.<method>(...)`（仅 ClassWrapper 已物化方法名，
+     *   判定=__lspClassMeta[cls].methods）→ send `{t:"lsp.rpc_inner", id:当前rpc id, args:[自定义参数]}`（B2：
+     *   参数编码后上行；空数组=未提供 → Kotlin 安全回退原参）+ 返回 Promise；
      *   原方法结果经 `rpc.exports.__lspHookOriginalReply(X, retJson)` 回投 resolve（per-id FIFO）；
      *   其它属性访问/赋值仍抛可读 Error。
      * - argsJson 契约（Kotlin 侧构建，t7 对齐）：`{"key":"<cls>#<method>","args":[...],"this":{...}|null}`；
@@ -151,23 +154,39 @@ object GumJsBridge {
             return __lspErr("unsupported: " + what + "（RouteB B1 不实现，请用返回值/参数处理或 observe 语义）");
           }
 
-          // ---- t9：async this.method 桥（cap 裁定更新：不再抛错，统一 await 桥）----
-          // this.<method>(...)（仅 ClassWrapper 上已物化过的方法名）→ send({t:"lsp.rpc_inner", id:<当前rpc id>})
-          // + 返回 Promise；原方法结果经 __lspHookOriginalReply(同 id) 回投 resolve。
-          // 字段契约（t7/cpp 已实读）：JS 上行 {t:"lsp.rpc_inner", id:X}（GumJS send 自动包 {type:"send",payload}）；
+          // ---- t9+B2：async this.method 桥（cap 裁定更新：不再抛错，统一 await 桥；B2 支持自定义参数）----
+          // this.<method>(...)（仅 ClassWrapper 上已物化过的方法名）→ send({t:"lsp.rpc_inner", id:<当前rpc id>,
+          //   args:[...]})（args 为 B2 新增：自定义参数编码；空数组=未提供）→ 返回 Promise；
+          // 原方法结果经 __lspHookOriginalReply(同 id) 回投 resolve。
+          // 字段契约（t15）：JS 上行 {t:"lsp.rpc_inner", id:X, args:数组|null}（GumJS send 自动包 {type:"send",payload}）；
           // C→JS：["frida:rpc", origId, "call", ["__lspHookOriginalReply", [X, retJson]]]。
           var __lspInnerPending = Object.create(null); // id -> [{resolve,reject}]（FIFO：Kotlin 串行服务，回复按序）
           var __lspClassMeta = Object.create(null);    // cls -> {methods}（已物化方法名集合，this 代理判定源）
 
+          // B2 参数编码（与 Kotlin encodeValue 同构的子集）：基础类型直 JSON；数组递归；占位/其它对象 → 占位
+          function __lspEncodeArg(v) {
+            if (v === null || v === undefined) { return null; }
+            var t = typeof v;
+            if (t === "number" || t === "string" || t === "boolean") { return v; }
+            if (t === "object") {
+              if (Array.isArray(v)) { return v.map(__lspEncodeArg); }
+              if (v.__obj !== undefined) { return v; }   // Kotlin 侧占位透传
+              return { __obj: "Object@js" };             // 其它对象 → 占位（Kotlin CAST_FAIL → 安全回退原参）
+            }
+            return { __obj: "Function@js" };
+          }
+          function __lspEncodeArgs(list) { return list.map(__lspEncodeArg); }
+
           function __lspInnerBridge(rpcId, method) {
             return function () {
+              var args = Array.prototype.slice.call(arguments, 0);
               var q = __lspInnerPending[rpcId] || (__lspInnerPending[rpcId] = []);
               return new Promise(function (resolve, reject) {
                 var item = { resolve: resolve, reject: reject };
                 q.push(item);
                 try {
-                  // 参数被忽略（t7 契约：原方法以原参 proceed）；send 自动包 {type:"send",payload}
-                  send({ t: "lsp.rpc_inner", id: rpcId });
+                  // B2：args 随消息上行（空数组=未提供参数 → Kotlin 安全回退原参）
+                  send({ t: "lsp.rpc_inner", id: rpcId, args: __lspEncodeArgs(args) });
                 } catch (e) {
                   var i = q.indexOf(item);
                   if (i >= 0) { q.splice(i, 1); }
@@ -219,13 +238,22 @@ object GumJsBridge {
               return JSON.stringify({ over: true, r: r });        // 替换语义：跳过原方法
             };
             // 原方法结果回投（X 与 rpc_inner 上行同源；per-id FIFO 取首个挂起 Promise resolve）
+            // B2：解包 __ret——用户 `return this.bar(a)` 应拿到原始结果而非 {"__ret":...} 包装
             rpc.exports.__lspHookOriginalReply = function (X, retJson) {
               var key = String(X);
               var q = __lspInnerPending[key];
               if (!q || q.length === 0) { return undefined; } // 未命中：静默防泄漏（cpp 已兜底）
               var item = q.shift();
+              var w;
               try {
-                item.resolve(JSON.parse(retJson));
+                w = JSON.parse(retJson);
+              } catch (e) {
+                item.reject(e);
+                if (q.length === 0) { delete __lspInnerPending[key]; }
+                return undefined;
+              }
+              try {
+                item.resolve((w && w.__ret !== undefined) ? w.__ret : w);
               } catch (e) {
                 item.reject(e);
               }
@@ -236,35 +264,59 @@ object GumJsBridge {
             console.log("[lsp] WARN: rpc global 不可用，替换通道降级为观察语义");
           }
 
+          // B2：MethodWrapper 增加 overload(...sigs) 精确选择（缺省=挂全部，现状零改动）。
+          // selKey = <cls>#<method>#<sigs 逗号串>（Kotlin 侧 tag）；lsp.hook 携带 sigs 数组供过滤。
           function __lspMethodWrapper(cls, method) {
             var key = __lspKey(cls, method);
             var impl;
             var w = Object.create(null);
+
+            function __lspApply(selKey, sigs, v) {
+              if (v === null) {
+                if (__lspRegistered[selKey]) {
+                  delete __lspRegistered[selKey];
+                  delete __lspUserFns[selKey];
+                  try { send({ t: "lsp.unhook", cls: cls, method: method, tag: selKey }); } catch (e) {}
+                }
+                return;
+              }
+              if (typeof v !== "function") { throw __lspErr("implementation 必须是函数或 null"); }
+              __lspUserFns[selKey] = v;
+              if (__lspRegistered[selKey]) {
+                // 重复赋值=重注册：先卸旧 handle（Kotlin 侧按 key 幂等 + 重挂即生效）
+                try { send({ t: "lsp.unhook", cls: cls, method: method, tag: selKey }); } catch (e) {}
+              }
+              __lspRegistered[selKey] = true;
+              try {
+                var msg = { t: "lsp.hook", cls: cls, method: method, tag: selKey, act: "", mode: "replace" };
+                if (sigs !== null) { msg.sigs = sigs; }
+                send(msg);
+              } catch (e) {
+                console.log("[lsp] hook send failed: " + e);
+              }
+            }
+
             Object.defineProperty(w, "implementation", {
               configurable: true, enumerable: true,
               get: function () { return impl; },
               set: function (v) {
-                if (v === null) {
-                  if (__lspRegistered[key]) {
-                    delete __lspRegistered[key];
-                    delete __lspUserFns[key];
-                    try { send({ t: "lsp.unhook", cls: cls, method: method, tag: key }); } catch (e) {}
-                  }
-                  impl = undefined;
-                  return;
-                }
-                if (typeof v !== "function") { throw __lspErr("implementation 必须是函数或 null"); }
-                __lspUserFns[key] = v;
-                if (__lspRegistered[key]) {
-                  // 重复赋值=重注册：先卸旧 handle（Kotlin 侧按 key 幂等 + 重挂即生效）
-                  try { send({ t: "lsp.unhook", cls: cls, method: method, tag: key }); } catch (e) {}
-                }
-                __lspRegistered[key] = true;
-                try {
-                  send({ t: "lsp.hook", cls: cls, method: method, tag: key, act: "", mode: "replace" });
-                } catch (e) {
-                  console.log("[lsp] hook send failed: " + e);
-                }
+                impl = (v === null ? undefined : v);
+                __lspApply(key, null, v);
+              }
+            });
+            Object.defineProperty(w, "overload", {
+              configurable: true, enumerable: true,
+              value: function () {
+                var sigs = Array.prototype.slice.call(arguments, 0).map(String);
+                if (sigs.length === 0) { throw __lspErr("overload 需要至少一个类型参数（如 'I'/'java.lang.String'）"); }
+                var selKey = key + "#" + sigs.join(",");
+                var sel = Object.create(null);
+                Object.defineProperty(sel, "implementation", {
+                  configurable: true, enumerable: true,
+                  get: function () { return __lspUserFns[selKey]; },
+                  set: function (v) { __lspApply(selKey, sigs, v); }
+                });
+                return sel;
               }
             });
             return w;

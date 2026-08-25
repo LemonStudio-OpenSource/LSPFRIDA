@@ -8,8 +8,6 @@ captures/
 .cxx/
 local.properties
 
-# --- 第三方 devkit（重新下载：见 README.md 构建说明）---
-app/src/main/cpp/frida-gumjs-devkit/
 
 # --- 实核临时材料（DSH 内部，不入库）---
 .tmp-ref/
@@ -22,3 +20,6 @@ app/src/main/cpp/frida-gumjs-devkit/
 .acside/
 .plugin-tmp/
 .backup/
+
+# --- Frida GumJS devkit（大文件，按 README 下载）---
+app/src/main/cpp/frida-gumjs-devkit/

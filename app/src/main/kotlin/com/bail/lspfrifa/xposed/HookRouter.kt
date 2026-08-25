@@ -31,14 +31,16 @@ import java.util.concurrent.atomic.AtomicLong
  *      → JS rpc.exports.__lspHookReply(id, argsJson) 执行用户 fn → dispatcher 自动标准 reply
  *      → cpp on_message 消费 reply（命中 pending 才回传 Kotlin，其余静默）→ callJs 返回：
  *        ""                → 超时/异常 → chain.proceed()（原参，原方法必执行——目标不崩）
- *        {"__inner":true}  → async fn 内 await this.method(...) 原调用请求：
- *                            chain.proceed()（B1 无改参——传原始参数）→ nativePostOriginalReply
+ *        {"__inner":true[,"args":[...]]} → async fn 内 await this.method(...) 原调用请求（B2：args 为
+ *                            自定义参数，按 parameterTypes 转换后 proceed(convArgs)；无 args/不可转换
+ *                            → 安全回退原参 proceed()）→ nativePostOriginalReply
  *                            → 再次 callJs(id,"") 续等最终 reply（同 id 栈复用，最多 500ms/阶段）
  *        {"over":false}    → fn 返回 undefined（观察语义）→ chain.proceed() 返回原值
  *        {"over":true,"r":…} → 解码 r（按 executable 返回类型转换）→ return r（跳过原方法）
  *
- * B1 已定案（Facts §5 / cap 裁定 2026-08-25）：改参不支持（B2）；对象参数/返回为占位/透传；
+ * B1/B2 已定案（Facts §5 / cap 裁定）：对象参数/返回为占位/透传（CAST_FAIL 安全回退原参）；
  * 同步 fn 内 this.method → shim 抛可读错误 → error reply → 按 over=false 处理。
+ * B2（t15）：overload('I','java.lang.String') 精确选择（sigs 过滤）+ this.method 自定义参数。
  */
 class HookRouter(
     private val targetPackage: String,
@@ -54,6 +56,8 @@ class HookRouter(
         val tag: String,
         val act: String,
         val mode: String,
+        /** B2：overload 精确选择（参数类型数组，如 ["I","java.lang.String"]）；null=挂全部 */
+        val sigs: List<String>? = null,
     )
 
     /** 已挂 handle（key = cls#method#sig#tag；t7 修复 t2 P0#1：签名入键，overload 不再互相覆盖/泄漏） */
@@ -146,12 +150,14 @@ class HookRouter(
             val cls = payload.optString("cls")
             val method = payload.optString("method")
             if (cls.isEmpty() || method.isEmpty()) return null
+            val sigsArr = payload.optJSONArray("sigs")
             HookRequest(
                 clsName = cls,
                 methodName = method,
                 tag = payload.optString("tag"),
                 act = payload.optString("act"),
                 mode = payload.optString("mode"),
+                sigs = if (sigsArr == null) null else (0 until sigsArr.length()).map { sigsArr.getString(it) },
             )
         } catch (_: Throwable) {
             null
@@ -195,11 +201,28 @@ class HookRouter(
             return
         }
 
-        val methods = clazz.declaredMethods.filter { it.name == req.methodName }
-        if (methods.isEmpty()) {
+        val allMethods = clazz.declaredMethods.filter { it.name == req.methodName }
+        if (allMethods.isEmpty()) {
             // 方法不是"本类直接声明"（如只写接口方法名）或重载名不存在：提示而非静默
             hostLog("[lsp-hook] MISS method=${req.clsName}#${req.methodName} (declared methods only)")
             return
+        }
+
+        // B2：overload 精确选择——按 parameterTypes 描述符串过滤（缺省 sigs=null 时挂全部，现状零改动）
+        val methods: List<Method> = if (req.sigs == null) {
+            allMethods
+        } else {
+            val want = req.sigs.map { normalizeSig(it) }
+            allMethods.filter { m ->
+                m.parameterTypes.map { descriptorOf(it) } == want
+            }.also { filtered ->
+                if (filtered.isEmpty()) {
+                    hostLog(
+                        "[lsp-hook] MISS_OVERLOAD ${req.clsName}#${req.methodName} sigs=${req.sigs} " +
+                            "(found=${allMethods.size} overloads)"
+                    )
+                }
+            }
         }
 
         var armed = 0
@@ -219,7 +242,8 @@ class HookRouter(
             }
         }
         hostLog(
-            "[lsp-hook] ARMED ${req.clsName}#${req.methodName} overloads=$armed mode=${req.mode} tag=${req.tag}" +
+            "[lsp-hook] ARMED ${req.clsName}#${req.methodName} overloads=$armed mode=${req.mode} " +
+                "sigs=${req.sigs ?: "all"} tag=${req.tag}" +
                 (if (failed > 0) " failed=$failed" else "")
         )
     }
@@ -260,20 +284,33 @@ class HookRouter(
                 val id = "lsp-${reqSeq.incrementAndGet()}"
                 var reply = GumJsBridge.callJs(id, payload)
 
-                // 嵌套服务循环：async fn 内 await this.method(...)（同 id 栈复用）
-                while (reply == INNER_MARKER) {
-                    // B1 无改参：以原始参数执行原方法；JS 侧改参请求（如有）不生效（B2）
-                    val origResult = chain.proceed()
+                // 嵌套服务循环：async fn 内 await this.method(...)（同 id 栈复用；B2 支持自定义参数）。
+                // innerExecuted/lastInnerResult：原方法已在内层执行过 → 后续超时/观察/CAST/JS_ERR
+                // 一律复用其结果（**不再二次 chain.proceed()——否则原方法执行两遍**）。
+                var innerExecuted = false
+                var lastInnerResult: Any? = null
+                var inner = parseInnerArgs(reply)
+                while (inner != null) {
+                    // B2：非空 args 且按参数类型转换成功 → proceed(convArgs)；否则安全回退原参
+                    val method = chain.executable as? Method
+                    val conv = if (inner.length() > 0 && method != null) {
+                        decodeArgs(method.parameterTypes, inner)
+                    } else null
+                    val origResult = if (conv != null) chain.proceed(conv) else chain.proceed()
+                    lastInnerResult = origResult
+                    innerExecuted = true
                     GumJsBridge.postOriginalReply(id, encodeRet(origResult))
                     reply = GumJsBridge.callJs(id, "")
+                    inner = parseInnerArgs(reply)
                 }
 
                 when {
                     reply.isEmpty() -> {
                         hostLog("[lsp-hook] REPLACE_TIMEOUT tag=${req.tag} id=$id")
-                        chain.proceed()   // 超时兜底：原方法必执行
+                        if (innerExecuted) lastInnerResult else chain.proceed()
+                        // 超时兜底：内层未执行 → 原方法必执行；已执行 → 复用其结果
                     }
-                    else -> decodeReply(reply, chain, req)
+                    else -> decodeReply(reply, chain, req, innerExecuted, lastInnerResult)
                 }
             } catch (t: Throwable) {
                 // 注意：不在此处再次 chain.proceed()——若异常来自原方法（proceed 抛出），
@@ -284,16 +321,24 @@ class HookRouter(
         }
     }
 
-    private fun decodeReply(reply: String, chain: XposedInterface.Chain, req: HookRequest): Any? {
+    private fun decodeReply(
+        reply: String,
+        chain: XposedInterface.Chain,
+        req: HookRequest,
+        innerExecuted: Boolean,
+        lastInnerResult: Any?,
+    ): Any? {
         return try {
             val json = JSONObject(reply)
             val err = json.optString("err", null)
             if (err != null) {
                 hostLog("[lsp-hook] JS_ERR tag=${req.tag} err=$err")
-                return chain.proceed()
+                // JS 抛错：内层已执行 → 复用原方法结果（不二次执行）；否则 proceed
+                return if (innerExecuted) lastInnerResult else chain.proceed()
             }
             if (!json.optBoolean("over")) {
-                return chain.proceed()   // 观察语义：返回原值
+                // 观察语义（返回原值）：内层已执行 → 该值即原方法结果；否则 proceed
+                return if (innerExecuted) lastInnerResult else chain.proceed()
             }
             val r = json.opt("r")
             val retType = (chain.executable as? Method)?.returnType ?: Void.TYPE
@@ -303,12 +348,12 @@ class HookRouter(
             val v = decodeRet(retType, r)
             if (v === RET_FALLBACK) {
                 hostLog("[lsp-hook] CAST_FAIL tag=${req.tag} retType=${retType.simpleName} r=$r")
-                return chain.proceed()
+                return if (innerExecuted) lastInnerResult else chain.proceed()
             }
             v
         } catch (t: Throwable) {
             hostLog("[lsp-hook] DECODE_ERR tag=${req.tag} err=${t.message}")
-            chain.proceed()
+            if (innerExecuted) lastInnerResult else chain.proceed()
         }
     }
 
@@ -393,8 +438,68 @@ class HookRouter(
         }
     }
 
+    // ---- B2：overload sigs 归一化 / 内层参数解码 ----
+
+    /** 解析内层标记：{"__inner":true[, "args":[…]]} → args（无 args 字段/非数组 → null=原参回退） */
+    private fun parseInnerArgs(reply: String): JSONArray? {
+        return try {
+            val json = JSONObject(reply)
+            if (!json.optBoolean("__inner")) null else json.optJSONArray("args")
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** 按参数类型把 JSON 数组转换为 Object[]；任何一项不可转换 → null（调用方回退原参） */
+    private fun decodeArgs(types: Array<Class<*>>, arr: JSONArray): Array<Any?>? {
+        if (arr.length() != types.size) return null
+        val out = arrayOfNulls<Any?>(types.size)
+        for (i in types.indices) {
+            val v = decodeRet(types[i], arr.opt(i))
+            if (v === RET_FALLBACK) return null
+            out[i] = v
+        }
+        return out
+    }
+
+    /** Java 类型 → JVM 描述符（数组递归） */
+    private fun descriptorOf(c: Class<*>): String = when {
+        c.isArray -> "[" + descriptorOf(c.componentType)
+        c.isPrimitive -> when (c) {
+            java.lang.Integer.TYPE -> "I"
+            java.lang.Long.TYPE -> "J"
+            java.lang.Float.TYPE -> "F"
+            java.lang.Double.TYPE -> "D"
+            java.lang.Boolean.TYPE -> "Z"
+            java.lang.Byte.TYPE -> "B"
+            java.lang.Short.TYPE -> "S"
+            java.lang.Character.TYPE -> "C"
+            java.lang.Void.TYPE -> "V"
+            else -> "L" + c.name.replace('.', '/') + ";"
+        }
+        else -> "L" + c.name.replace('.', '/') + ";"
+    }
+
+    /** JS 侧 sig 归一化（'I'/'int'/'java.lang.String'/'int[]'/'[I' 等形态 → JVM 描述符） */
+    private fun normalizeSig(s: String): String {
+        val t = s.trim()
+        if (t.endsWith("[]")) return "[" + normalizeSig(t.substring(0, t.length - 2))
+        if (t.startsWith("[") && t.length > 1) return t   // 已描述符形态
+        return when (t) {
+            "I", "int" -> "I"
+            "J", "long" -> "J"
+            "F", "float" -> "F"
+            "D", "double" -> "D"
+            "Z", "boolean" -> "Z"
+            "B", "byte" -> "B"
+            "S", "short" -> "S"
+            "C", "char" -> "C"
+            "V", "void" -> "V"
+            else -> if (t.startsWith("L") && t.endsWith(";")) t else "L" + t.replace('.', '/') + ";"
+        }
+    }
+
     private companion object {
-        const val INNER_MARKER = """{"__inner":true}"""
         const val MAX_SAFE_LONG = 9007199254740992L   // 2^53
     }
 }

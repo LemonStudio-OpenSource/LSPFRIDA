@@ -1,7 +1,10 @@
 package com.bail.lspfrifa.xposed
 
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface
 
@@ -26,6 +29,10 @@ class LSPFRIFAModule : XposedModule() {
         private const val REMOTE_GROUP = "lspfrifa_config"
         private const val KEY_ENABLED = "enabled"
         private fun scriptKey(pkg: String) = "script.$pkg"
+
+        // t14：注入提示开关（与宿主 InjectHintStore.KEY 严格一致）——冷注入路径的 hint 源：
+        // 宿主 InjectHintStore.setEnabled 双通道写 remote prefs，模块此处只读
+        private const val KEY_HINT = "hint_inject"
 
         // Provider 不可达（宿主未运行/被停用/不可见等）时的启用检查重试：
         // 失败不再视为"未选中"直接放弃，而是延迟重试，等宿主恢复后继续初始化链。
@@ -228,7 +235,11 @@ class LSPFRIFAModule : XposedModule() {
             val code = prefs.getString(scriptKey(packageName), null)
             if (!code.isNullOrBlank()) {
                 log(Log.INFO, TAG, "event=load_persisted_script pkg=$packageName size=${code.length} src=remote_prefs")
-                GumJsBridge.loadScript(code)
+                if (GumJsBridge.loadScript(code)) {
+                    // t14：冷注入成功提示（hint 经 remote prefs 下发；此前冷路径直接调
+                    // GumJsBridge.loadScript 绕过 TargetIpcServer.loadScript → 永不 Toast）
+                    notifyInjectionHint(context, packageName)
+                }
                 return
             }
         } catch (t: Throwable) {
@@ -242,12 +253,33 @@ class LSPFRIFAModule : XposedModule() {
             val scriptCode = bundle?.getString("script_content")
             if (!scriptCode.isNullOrBlank()) {
                 log(Log.INFO, TAG, "event=load_persisted_script pkg=$packageName size=${scriptCode.length} src=provider")
-                GumJsBridge.loadScript(scriptCode)
+                if (GumJsBridge.loadScript(scriptCode)) {
+                    notifyInjectionHint(context, packageName)
+                }
             } else {
                 log(Log.INFO, TAG, "event=no_persisted_script pkg=$packageName waiting_for_ipc")
             }
         } catch (e: Exception) {
             log(Log.WARN, TAG, "event=load_script_deferred pkg=$packageName err=${e.message}")
+        }
+    }
+
+    /**
+     * t14：冷注入成功 Toast（注入提示开关）。hint 来源=remote prefs（宿主 InjectHintStore.setEnabled
+     * 双通道写入；模块只读）；remote 不可读时默认开（与宿主 InjectHintStore.isEnabled() 默认 true 一致）。
+     * Toast 必须主线程——本方法可能运行在 lspfrifa-init/后台线程，post 兜底。
+     */
+    private fun notifyInjectionHint(context: android.content.Context, packageName: String) {
+        val enabled = try {
+            getRemotePreferences(REMOTE_GROUP).getBoolean(KEY_HINT, true)
+        } catch (t: Throwable) {
+            true
+        }
+        if (!enabled) return
+        Handler(Looper.getMainLooper()).post {
+            try {
+                Toast.makeText(context, "LSPFRIFA 已注入: $packageName", Toast.LENGTH_SHORT).show()
+            } catch (_: Throwable) {}
         }
     }
 

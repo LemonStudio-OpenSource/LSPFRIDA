@@ -53,6 +53,7 @@ typedef struct _LspPending {
     gchar *result;      // 终态 reply value（ok 的 value / error 的 {"over":false,"err":..}）或 NULL
     gboolean done;
     gboolean has_inner; // 收到 lsp.rpc_inner（一次一个；Kotlin 消费后复位）
+    gchar *inner_args;  // B2：内层自定义参数（JSON 数组文本，来自 lsp.rpc_inner.args）；NULL=原参回退
 } LspPending;
 
 static GMutex g_pending_lock;
@@ -63,6 +64,26 @@ static LspPending *pending_new(void) {
     LspPending *p = g_slice_new0(LspPending);
     g_cond_init(&p->cond);
     return p;
+}
+
+/** 释放 pending 条目（owner 线程终态使用；调用方须持有 g_pending_lock）。 */
+static void pending_free(LspPending *p) {
+    if (p == nullptr) return;
+    g_cond_clear(&p->cond);
+    g_free(p->result);
+    g_free(p->inner_args);
+    g_slice_free(LspPending, p);
+}
+
+/** DevilKit 单头仅提供 _frida_* 宏而无 glib 原型：自实现 hash/equal（g_hash_table_new 参数）。 */
+static guint lsp_str_hash(gconstpointer v) {
+    const unsigned char *s = (const unsigned char *)v;
+    guint h = 5381;
+    while (*s != 0) h = ((h << 5) + h) + *s++;
+    return h;
+}
+static gboolean lsp_str_equal(gconstpointer a, gconstpointer b) {
+    return a == b || (a != nullptr && b != nullptr && strcmp((const char *)a, (const char *)b) == 0);
 }
 
 /** 构建 {"over":false,"err":"..."}（错误 reply 的结果；转义由 json-glib 保证） */
@@ -97,7 +118,8 @@ static gchar *build_rpc_call(const gchar *rpc_id, const gchar *export_name,
     json_builder_begin_array(b);
     json_builder_add_string_value(b, a1);
     if (a2 != nullptr) json_builder_add_string_value(b, a2);
-    json_builder_end_array(b);
+    json_builder_end_array(b);   // args
+    json_builder_end_array(b);   // 整体消息数组
     JsonNode *root = json_builder_get_root(b);
     JsonGenerator *g = json_generator_new();
     json_generator_set_root(g, root);
@@ -129,12 +151,33 @@ static gchar *node_to_json(JsonNode *node) {
     return out;
 }
 
+/** 解 GumJS 消息信封：JS send 的消息为 {"type":"send","payload":X}（frida GumJS 协议）。
+ *  X 为数组（rpc reply / rpc call）或对象（lsp.rpc_inner 等）。裸数组（旧直连）亦兼容。 */
+static JsonNode *unwrap_send_payload(JsonNode *root) {
+    if (root == nullptr) return nullptr;
+    if (JSON_NODE_HOLDS_ARRAY(root)) return root;             // 兼容裸数组
+    if (JSON_NODE_HOLDS_OBJECT(root)) {
+        JsonObject *obj = json_node_get_object(root);
+        gchar *type = node_string(json_object_get_member(obj, "type"));
+        if (type != nullptr && strcmp(type, "send") == 0) {
+            g_free(type);
+            JsonNode *pn = json_object_get_member(obj, "payload");
+            if (pn != nullptr && (JSON_NODE_HOLDS_ARRAY(pn) || JSON_NODE_HOLDS_OBJECT(pn))) {
+                return pn;
+            }
+            return nullptr;
+        }
+        g_free(type);
+    }
+    return nullptr;
+}
+
 /**
  * on_message 消费 frida:rpc reply（["frida:rpc", id, "ok"|"error", ...]）。
  * @return true = 已消费（不再上行 Kotlin）
  */
 static gboolean handle_rpc_reply(const gchar *message) {
-    if (message == nullptr || message[0] != '[') return FALSE;
+    if (message == nullptr || (message[0] != '[' && message[0] != '{')) return FALSE;
     JsonParser *parser = json_parser_new();
     if (!json_parser_load_from_data(parser, message, -1, nullptr)) {
         g_object_unref(parser);
@@ -142,8 +185,9 @@ static gboolean handle_rpc_reply(const gchar *message) {
     }
     gboolean consumed = FALSE;
     JsonNode *root = json_parser_get_root(parser);
-    if (root != nullptr && JSON_NODE_HOLDS_ARRAY(root)) {
-        JsonArray *arr = json_node_get_array(root);
+    JsonNode *msg = unwrap_send_payload(root);   // 信封解开（send 型/裸数组）
+    if (msg != nullptr && JSON_NODE_HOLDS_ARRAY(msg)) {
+        JsonArray *arr = json_node_get_array(msg);
         guint len = json_array_get_length(arr);
         if (len >= 3) {
             JsonNode *n0 = json_array_get_element(arr, 0);
@@ -179,6 +223,14 @@ static gboolean handle_rpc_reply(const gchar *message) {
                         p->result = value;
                         p->done = TRUE;
                         g_cond_broadcast(&p->cond);
+                        // t10-C③：rpc reply 命中诊断（id/type/长度）
+                        LOGI("[rpc-reply] HIT id=%s type=%s len=%zu", id, type, value ? strlen(value) : 0);
+                    } else {
+                        // t10-C①：启动探针——boot rpc 的 reply 无 pending（key 不存在 → shim 返回
+                        // over:false 静默消费）；此日志=出站链路贯通证明
+                        if (strcmp(id, "lsp-boot-check") == 0) {
+                            LOGI("[boot] rpc reply consumed, id=%s type=%s", id, type);
+                        }
                     }
                     // 未命中 pending（如 lsp-orig-N 的自动 reply）：仍消费，不上行 Kotlin
                     g_mutex_unlock(&g_pending_lock);
@@ -216,14 +268,24 @@ static gboolean handle_rpc_inner(const gchar *message) {
                 if (t_str != nullptr && strcmp(t_str, "lsp.rpc_inner") == 0) {
                     gchar *id = node_string(json_object_get_member(payload, "id"));
                     if (id != nullptr) {
+                        // B2：透传自定义参数（payload.args，JSON 数组；缺省/非数组 → NULL=原参回退）
+                        gchar *args = node_to_json(json_object_get_member(payload, "args"));
                         g_mutex_lock(&g_pending_lock);
                         LspPending *p = (g_pending != nullptr)
                             ? (LspPending *)g_hash_table_lookup(g_pending, id) : nullptr;
                         if (p != nullptr && !p->done) {
                             p->has_inner = TRUE;
+                            g_free(p->inner_args);
+                            p->inner_args = args;
+                            args = nullptr;
                             g_cond_broadcast(&p->cond);
                         }
+                        // t10-C②：嵌套原调用请求诊断（B2 追加 args 提示）
+                        LOGI("[rpc-inner] id=%s hit=%d args=%s", id,
+                            (p != nullptr && !p->done) ? 1 : 0,
+                            (p != nullptr && p->inner_args != nullptr) ? "yes" : "no");
                         g_mutex_unlock(&g_pending_lock);
+                        g_free(args);
                         g_free(id);
                         consumed = TRUE;   // 无论命中与否：rpc_inner 不上行 Kotlin
                     }
@@ -252,6 +314,8 @@ static void pending_clear_all(void) {
             LspPending *p = (LspPending *)v;
             g_free(p->result);
             p->result = nullptr;
+            g_free(p->inner_args);
+            p->inner_args = nullptr;
             p->done = TRUE;
             g_cond_broadcast(&p->cond);
         }
@@ -274,6 +338,10 @@ static void on_message(const gchar *message, GBytes *data, gpointer user_data) {
 
     // RouteB：frida:rpc reply 与 lsp.rpc_inner 在 native 层原生消费（不进 Kotlin / 不上行宿主 UI）
     if (message != nullptr) {
+        // t10-C②：入站消息头诊断（仅 frida:rpc 数组消息——send/console.log 走 Kotlin UI 日志不重复打）
+        if (strstr(message, "frida:rpc") != nullptr) {
+            LOGI("[onmsg] rpc-head=%.48s", message);
+        }
         if (handle_rpc_reply(message)) return;
         if (handle_rpc_inner(message)) return;
     }
@@ -391,6 +459,29 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeLoadScript(
     }
 
     LOGI("script [%s] loaded", name);
+
+    // t10-A：显式请求调度器 start（幂等——js_thread 非空即 no-op；首次 push 已惰性启动，
+    // 此处为防御（fork/Worker 等路径复位）+ 日志佐证）。
+    gum_script_scheduler_start(gum_script_backend_get_scheduler());
+    LOGI("scheduler start requested (idempotent)");
+
+    // t10-C①：启动探针——post boot rpc（key="boot" 不存在于用户 fn 注册表 → shim 走
+    // "未注册 key → 返回 over:false"静默路径，不触发任何用户 fn；其自动 reply 无 pending，
+    // 由 handle_rpc_reply 打 "[boot] rpc reply consumed"）。该 reply 经 default context 出站，
+    // 会在首次 nativeCallJs 的 t10-B 泵送周期被派发 → 一次性证明"出站→入站"链路贯通。
+    {
+        gchar *boot = build_rpc_call("lsp-boot-check", "__lspHookReply", "lsp-boot-check",
+            "{\"key\":\"boot\",\"args\":[],\"this\":null}");
+        gum_script_post(g_script, boot, nullptr);
+        g_free(boot);
+        // 非阻塞抽干一次（load 泵的延续；若 reply 已回，LOGI 立即出现）
+        GMainContext *dctx = g_main_context_default();
+        while (g_main_context_pending(dctx)) {
+            g_main_context_iteration(dctx, FALSE);
+        }
+        LOGI("[boot] boot rpc posted (id=lsp-boot-check)");
+    }
+
     env->ReleaseStringUTFChars(jscript, src);
     env->ReleaseStringUTFChars(jname, name);
     return JNI_TRUE;
@@ -426,9 +517,13 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeCallJs(JNIEnv *env, jclass, jstr
 
     gboolean do_post = (payload != nullptr && payload[0] != '\0');
 
+    // t10-C②：nativeCallJs 入口诊断（id + 是否首次发请求 + payload 长度）
+    LOGI("[calljs] id=%s post=%d payload_len=%zu", id, do_post ? 1 : 0,
+        payload != nullptr ? strlen(payload) : 0);
+
     g_mutex_lock(&g_pending_lock);
     if (g_pending == nullptr) {
-        g_pending = g_hash_table_new(g_str_hash, g_str_equal);
+        g_pending = g_hash_table_new(lsp_str_hash, lsp_str_equal);
     }
     LspPending *p = (LspPending *)g_hash_table_lookup(g_pending, id);
     if (p == nullptr) {
@@ -450,13 +545,32 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeCallJs(JNIEnv *env, jclass, jstr
     if (p == nullptr) {
         out = g_strdup("");   // unload 竞态：条目已被清空
     } else {
-        gint64 deadline = g_get_monotonic_time() + (gint64)LSP_CALL_TIMEOUT_MS * 1000;
+        // t10-B：出站泵修复——JS→C（send/console.log/dispatcher 自动 reply）经 gum_quick_script_emit
+        // 附着在【全局默认 main context】（script.main-context=创建线程 task 的 thread-default context，
+        // Java 线程无 thread-default → 回退 default context；见 t10 诊断）。若无人泵送，reply 永久排队
+        // → 500ms REPLACE_TIMEOUT。此处"释放锁→泵 default context（非阻塞）→10ms 切片短等"循环保证
+        // 出站消息被派发（on_message 由本线程同步执行→持锁写 pending→唤醒）；总预算仍 ≤500ms 兜底。
+        gint64 total_deadline = g_get_monotonic_time() + (gint64)LSP_CALL_TIMEOUT_MS * 1000;
+        GMainContext *dctx = g_main_context_default();
         while (!p->done && !p->has_inner) {
-            if (!g_cond_wait_until(&p->cond, &g_pending_lock, deadline)) break;   // 超时
+            g_mutex_unlock(&g_pending_lock);
+            // P1-1（t13 建议）：内层泵循环受总预算守卫（JS 生产速率异常时防无限泵）
+            while (g_main_context_pending(dctx) && g_get_monotonic_time() < total_deadline) {
+                g_main_context_iteration(dctx, FALSE);
+            }
+            g_mutex_lock(&g_pending_lock);
+            if (p->done || p->has_inner || g_get_monotonic_time() >= total_deadline) break;
+            g_cond_wait_until(&p->cond, &g_pending_lock,
+                MIN(total_deadline, g_get_monotonic_time() + 10 * 1000));
         }
         if (p->has_inner) {
             p->has_inner = FALSE;   // 消费一次内层请求（Kotlin 凭返回标记服务原方法）
-            out = g_strdup(LSP_INNER_MARKER);
+            // B2：args 透传（JSON 数组文本，由 node_to_json 产出——安全内嵌）；NULL → 无 args 字段
+            if (p->inner_args != nullptr) {
+                out = g_strdup_printf("{\"__inner\":true,\"args\":%s}", p->inner_args);
+            } else {
+                out = g_strdup(LSP_INNER_MARKER);
+            }
             // 条目保留：Kotlin 服务完内层后会再次调用本函数续等
         } else if (p->done) {
             out = g_strdup(p->result != nullptr ? p->result : "");

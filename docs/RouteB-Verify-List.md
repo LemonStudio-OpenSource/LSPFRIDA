@@ -61,3 +61,15 @@ Java.perform(function () {
 
 ## 判定
 全部预期输出命中 = 路线B B1 验收通过；任何偏差：把日志页**完整行**截图回传（含时间戳），cap 按检查点关键词定位。
+
+## 6. B2 验证（t15 交付后；含 t14 注入提示）
+
+| # | 场景 | 预期 |
+|---|---|---|
+| B2-1 | `Java.use("android.app.Activity").onCreate.overload('android.os.Bundle').implementation = function (b) { console.log("[vB2] onCreate(sig)"); return undefined; }` | ARMED 日志含 `sigs=[android.os.Bundle]` 且**只挂 1 个**（对照默认挂全部）；切应用 onCreate 命中一次 |
+| B2-2 | `await this.bar(新参)`：如 `Java.use("java.lang.System").currentTimeMillis.implementation = async function () { var r = await this.currentTimeMillis(); console.log("[vB2] millis=" + r); return 123; }`（无参方法为简版；带参请用 `java.lang.String.valueOf` 传参场景） | 原方法以**新参数**执行（带参场景验证） |
+| B2-3 | `return this.bar(a)` 透传模式（在 B2-1 的 onCreate 内 `return this.onCreate(b)`） | **只执行一次**（无双重执行） |
+| B2-4 | 默认注册（无 overload） | B1 场景回归（观察/替换/嵌套零变化） |
+| t14 | 设置「注入提示」**开** → 启用目标 → **冷启动目标应用** | 目标应用弹「LSPFRIFA 已注入: 包名」Toast；**关**→不弹 |
+
+（B2-2 带参原方法建议：`java.lang.StringBuilder.append`？——用**必然被调+可安全改参**的：`java.lang.System.currentTimeMillis` 无参不演示传参；传参建议 `android.util.Log.d`（String,String）覆盖返回 void——不可观察。**务实**：观察日志打印即可——`onCreate` 传 bundle 原样传参验证（B2-1 即窗口）；严格传参改用 `java.io.File.length`?——留给用户选择，**以 B2-1/B2-3 为核心判据**）

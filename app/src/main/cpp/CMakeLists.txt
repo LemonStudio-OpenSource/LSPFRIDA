@@ -22,6 +22,9 @@ add_library(gumjs_bridge SHARED gumjs_bridge.cpp)
 
 find_library(log-lib log)
 
+# t14: 防 --gc-sections 回收 frida 内置 sqlite 初始化（运行期 SIGSEGV pc=0，见崩溃栈）
+target_link_options(gumjs_bridge PRIVATE "-Wl,--undefined=_frida_sqlite3_initialize")
+
 target_link_libraries(gumjs_bridge
     frida-gumjs
     ${log-lib}

@@ -7,12 +7,19 @@
 
 ---
 
-## 0. 编译（最先做，失败即止）
+## 0. 编译（**已通过，本项仅需复核**）
+
+> **更正于 2026-09-26（审查发现）**：本清单初稿写"当前无 APK / 从未编译"，**与现场不符**。
+> 实测：`_build_run2.log`（07:21）`BUILD SUCCESSFUL in 2m 21s`，产出
+> `app/build/outputs/apk/debug/app-debug.apk`（90,385,982 B；dex 内含 `ScriptLibraryScreen`/`ImportTargetScreen`/`EarlyLogBuffer`）。
+> `find app/src -newer app-debug.apk` 为空 → **APK 与当前源码（=HEAD）一致，未过期**。
+> 07:17 的 `_build_run.log` 曾失败（`ScriptEditorScreenV1.kt:230 Unresolved reference 'Edit'`），
+> 缺失的 `top.yukonga.miuix.kmp.icon.extended.Edit`（第 65 行）随后已补齐，07:21 复编通过。
 
 ```bash
-sh gradlew --no-daemon :app:assembleDebug
+sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 ```
-- 预期：`BUILD SUCCESSFUL`，产出 `app/build/outputs/apk/debug/app-debug.apk`（当前只有 `output-metadata.json`，无 APK）。
+- 预期：`BUILD SUCCESSFUL`；APK 时间戳更新。
 - 常见已知坑（勿误判为本次改动引入）：raw string `$` 转义、CMake 4.1.2 环境、MTE 链接偶发——重试/清 `.cxx`。
 - 若报"未解析符号"：先看是否 `tools/check-kt.sh` 已覆盖（本次已双绿，故大概率是 IDE 增量缓存 → `sh gradlew --no-daemon clean :app:assembleDebug`）。
 
@@ -34,7 +41,8 @@ sh gradlew --no-daemon :app:assembleDebug
 | B1 | 设置/应用内 → 用**文件**导入一个 `.js`（SAF） | 出现导入预览；确认后入库；`origin=file:<uri>` |
 | B2 | 复制一段 JS → 用**剪贴板**导入 | 同上，`origin=clip` |
 | B3 | 在浏览器/文件管理器里对 `.js` 选"分享 → LSPFRIFA" | 进入 `import_target` 页；**只入库** 或 **应用到某目标** 二选一 |
-| B4 | B3 选"应用到目标" | 旧脚本自动备份（`script.<pkg>.bak.<ts>`）；新脚本生效 |
+| B4 | B3 选"应用到目标" | 旧脚本自动备份（实际键为 `bak.<pkg>.<ts>`；清单初稿误写为 `script.<pkg>.bak.<ts>`，已更正）；新脚本生效 |
+| B4b | 触发 `SaveResult.SIZE_EXCEEDED`：导入 300KB 脚本（**小于导入上限 1MB，故能过校验**）后在编辑器保存 | 提示"已入库，但超出下发上限 400KB"（`ScriptStore.MAX_SCRIPT_BYTES = 400*1024`）→ **1MB 导入上限与 400KB 下发上限不一致，是本清单最容易漏测的一处** |
 | B5 | 导入一个**空文件** | 提示"导入失败：内容为空" |
 | B6 | 导入一个**二进制文件**（如 .png） | 提示"导入失败：疑似二进制文件" |
 | B7 | 导入 >1MB 的文本 | 提示"导入失败：超过 1MB"（`ScriptImport.HARD_LIMIT_BYTES`） |
@@ -82,7 +90,8 @@ sh gradlew --no-daemon :app:assembleDebug
 
 | # | 操作 | 预期 |
 |---|---|---|
-| E1 | 路由走查 7 条 | main / select_project / project_detail / script_editor / logs / **script_library** / **import_target** 全部可达且返回正常 |
+| E1 | 路由走查 6 条 | main / select_project / project_detail / script_editor / logs / **script_library** / **import_target** —— 共 **7 条 route 声明**，但 **`import_target` 不在底部导航内**（由分享 Intent 触发），故导航走查按 6 条，`import_target` 用 §B3 分享路径覆盖 |
+| E1b | **C13 变体**：在 LSPosed 作用域内但**未在 LSPFRIFA 内启用**的目标，冷启动后于**本次开机首次**冷启动第二个目标 | `event=binder_handshake_deferred pkg=… err=…` → 后续 `binder_handshake_recovered attempt=…`（迟注册场景，与 §A3 的 force-stop 场景**不同**，易漏）。若连续失败则 `binder_reconnect_giveup` |
 | E2 | 详情页熔断状态轮询 | 熔断由目标侧上报驱动，可能随时断闸 → 详情页应自动出现熔断卡（无需手动刷新） |
 | E3 | 编辑器导入浮层 | 导入预览弹窗正常展示（**历史坑**：曾被 `lastIndexOf('}')` 插入破坏结构，现应整体重建无误） |
 | E4 | 注入提示 t14（历史待验项） | 设置开 → 冷启动目标 → 应用内 Toast「LSPFRIFA 已注入: 包名」；关 → 不弹 |
@@ -111,5 +120,6 @@ sh gradlew --no-daemon :app:assembleDebug
 2. 对象参数/返回值仍为 `__obj` 占位（B1/B2 既定边界）。
 3. 远程文件通道**只读**（宿主无法向目标推送文件）→ 脚本分发必须走 remote prefs。
 4. remote prefs **无事务语义**：`Editor.apply()` 失败仅打日志 → 写入靠**读回验证**。
-5. 模块化拼装（`modules.<pkg>`）**键已建但未接入注入链**（用户已明确暂缓，`setModules`/`enabledModules` 暂为未调用）→ 库页"应用"按脚本正文生效，不按模块粒度生效。
+5. **模块化拼装未接线（但库页可用）**：`modules.<pkg>` 键已建、`ScriptStore.setModules`/`enabledModules` 已定义**但全项目零调用**（用户已明确暂缓）→ **D9 模块粒度、D10 冲突语义当前均不生效**。**注意**：这不影响库页功能——库页「应用」是把脚本**正文**写入目标脚本（脚本级生效），与"按模块粒度开关"是两件事，勿混为一谈。
 6. 工作流 4 未实施 → 脚本 hook **未加载的应用类**仍然 `MISS`（这是工作流 4 要解决的）。
+7. **`EARLY_INJECT_ENABLED` 是 `private const val`（编译期常量）**：**没有运行期开关**。§C11 的回滚验证**不是设置项操作**，而是改源码常量为 `false` → **重新编译** → 冷启动观测。同理，它只存在于模块（目标进程）侧，宿主 UI 无法控制。

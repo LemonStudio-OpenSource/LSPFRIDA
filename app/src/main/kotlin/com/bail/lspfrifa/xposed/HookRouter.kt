@@ -350,7 +350,12 @@ class HookRouter(
     ): Any? {
         return try {
             val json = JSONObject(reply)
-            val err = json.optString("err", null)
+            // 不用 optString(name, null)：
+            //   ① Kotlin 对它报类型不匹配（Java 签名标 @NonNull，传 null 是平台类型灰色地带）；
+            //   ② 若 reply 带 JSON null（{"err":null}），opt 返回 JSONObject.NULL，
+            //      String.valueOf 会给出字串 "null"，从而被误判为 JS 错误。
+            val errRaw = json.opt("err")
+            val err = if (errRaw == null || errRaw === JSONObject.NULL) null else errRaw.toString()
             if (err != null) {
                 hostLog("[lsp-hook] JS_ERR tag=${req.tag} err=$err")
                 // JS 抛错：内层已执行 → 复用原方法结果（不二次执行）；否则 proceed
@@ -421,6 +426,9 @@ class HookRouter(
     private fun decodeRet(retType: Class<*>, r: Any?): Any? {
         return when {
             r == null || r === JSONObject.NULL -> null
+            // 下面同时比 Java 包装类与 Kotlin 原始类型（如 java.lang.Character vs Char）：
+            // 反射拿到的 retType 对 char/int 等方法返回的是原始类型（Character.TYPE），
+            // 而包装类场景返回 java.lang.Character —— 两者不等价，必须都查。
             retType == java.lang.String::class.java -> r as? String ?: RET_FALLBACK
             retType == java.lang.Character::class.java || retType == Char::class.java ->
                 (r as? String)?.firstOrNull() ?: RET_FALLBACK
@@ -484,7 +492,8 @@ class HookRouter(
 
     /** Java 类型 → JVM 描述符（数组递归） */
     private fun descriptorOf(c: Class<*>): String = when {
-        c.isArray -> "[" + descriptorOf(c.componentType)
+        // isArray 为 true 时 componentType 必然非空；Kotlin 无法从 Java 平台类型推断，故显式断言
+        c.isArray -> "[" + descriptorOf(c.componentType!!)
         c.isPrimitive -> when (c) {
             java.lang.Integer.TYPE -> "I"
             java.lang.Long.TYPE -> "J"

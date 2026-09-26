@@ -45,6 +45,7 @@ import top.yukonga.miuix.kmp.preference.RadioButtonPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.ColorSchemeMode
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import com.bail.lspfrifa.data.HookModeStore
 import com.bail.lspfrifa.data.InjectHintStore
 import com.bail.lspfrifa.data.ThemeModeStore
 import com.bail.lspfrifa.ipc.IpcManager
@@ -117,6 +118,24 @@ fun SettingsScreenV093(
                         },
                         title = "注入提示",
                         summary = "脚本注入成功时在目标应用弹出提醒（含包名）",
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    // D3③：类加载感知（激进模式）
+                    // 代价/收益已在 HookModeStore 注释里说明：进入目标 App 最热路径，
+                    // 换取“类一加载就挂上”（比轮询快约 200ms）。故默认关。
+                    var loadClassWatch by remember { mutableStateOf(HookModeStore.isLoadClassWatchEnabled()) }
+                    SwitchPreference(
+                        checked = loadClassWatch,
+                        onCheckedChange = {
+                            loadClassWatch = it
+                            HookModeStore.setLoadClassWatchEnabled(it)
+                        },
+                        title = "类加载感知",
+                        summary = if (loadClassWatch) {
+                            "脚本可在目标类加载时立即挂上（对已运行目标需重启后生效）"
+                        } else {
+                            "默认由轮询兼容：类未加载时约 200ms 内自动重试"
+                        },
                         modifier = Modifier.fillMaxWidth(),
                     )
                     // R2a：主题种子色（预设色板；点击选中/再点取消恢复默认）

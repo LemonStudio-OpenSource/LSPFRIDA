@@ -50,6 +50,12 @@ class LSPFRIFAModule : XposedModule() {
         private fun circuitKey(pkg: String) = "circuitOpen." + pkg
 
         /**
+         * D3③：类加载监听开关（与宿主 HookModeStore.KEY_LOADCLASS_WATCH 严格一致）。
+         * 默认关（激进模式）——loadClass 是目标 App 的热路径，由用户显式开启。
+         */
+        private const val KEY_LOADCLASS_WATCH = "loadclass_watch"
+
+        /**
          * D2：早期注入总开关。
          *
          * 关掉即退回“仅 Application 后注入”的旧行为（零风险回滚路径）。
@@ -198,6 +204,9 @@ class LSPFRIFAModule : XposedModule() {
             earlyRouter = router
             record(Log.INFO, "event=early_router_ready pkg=" + targetPackage)
 
+            // D3①：路由就绪后立即 flush 一次（脚本重跑场景下，待挂项可能已可解析）
+            runCatching { router.flushAtAnchor() }
+
             // ④ 脚本：只读 remote prefs（Provider 需要 Context，留给后续）。
             //    只有确实载入成功才置位 earlyScriptLoaded —— 否则 App 阶段必须继续尝试
             //    （它还有 Provider 回退与三态重试，这些是早期阶段拿不到的）。
@@ -269,6 +278,15 @@ class LSPFRIFAModule : XposedModule() {
                         name = "lspfrifa-init"
                     }.start()
                 }
+
+                // D3①：锚点 flush —— 在 Application.onCreate 执行**之前**（proceed 前），
+                // 尝试把待挂队列里“此刻已可解析”的 hook 挂上。
+                //
+                // 为何值得跑在主线程：Application 之前的资源极其稀缺，这是少数几个
+                // “框架保证会执行且我们已拦到”的时机；且 flushPending 有上限（FLUSH_MAX_ITEMS）
+                // 且队列空时立即返回（成本≈0），因此可估界。
+                runCatching { earlyRouter?.flushAtAnchor() }
+
                 chain.proceed()
             }
             record(Log.INFO, "event=app_hook_armed pkg=$targetPackage")
@@ -335,6 +353,16 @@ class LSPFRIFAModule : XposedModule() {
                 )
             }
             ipcServer.setHookRouter(hookRouter)
+
+            // D3③：按开关决定是否安装类加载监听（激进模式，默认关）。
+            // 失败不影响主链：监听只是“更快挂上”的优化，缺失时退化为 D3② 轮询。
+            val watchOn = runCatching {
+                getRemotePreferences(REMOTE_GROUP).getBoolean(KEY_LOADCLASS_WATCH, false)
+            }.getOrDefault(false)
+            if (watchOn) {
+                runCatching { hookRouter.installClassLoaderWatcher() }
+                record(Log.INFO, "event=loadclass_watch_requested pkg=" + targetPackage)
+            }
 
             // 3. 将 Binder 通过 Provider 传递给宿主进程完成握手
             registerBinderToHost(app, targetPackage, ipcServer)

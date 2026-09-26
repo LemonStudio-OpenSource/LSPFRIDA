@@ -42,8 +42,12 @@ class ScriptConfigProvider : ContentProvider() {
             "save_script" -> {
                 if (!isHostCall) throw SecurityException("host-only method '$method' denied for uid $callingUid")
                 val code = extras?.getString("script_content")
-                if (!code.isNullOrBlank()) ScriptStore.saveScript(packageName, code)
-                Bundle().apply { putBoolean("success", !code.isNullOrBlank()) }
+                val result = if (!code.isNullOrBlank()) ScriptStore.saveScript(packageName, code)
+                    else ScriptStore.SaveResult.SIZE_EXCEEDED
+                Bundle().apply {
+                    putBoolean("success", result == ScriptStore.SaveResult.OK || result == ScriptStore.SaveResult.LOCAL_ONLY)
+                    putString("result", result.name)
+                }
             }
             "remove_script" -> {
                 if (!isHostCall) throw SecurityException("host-only method '$method' denied for uid $callingUid")
@@ -70,6 +74,14 @@ class ScriptConfigProvider : ContentProvider() {
                 requirePackageUidMatches(packageName, callingUid)
                 Bundle().apply { putString("script_content", ScriptStore.loadScript(packageName)) }
             }
+            // ===== D12：目标侧上报脚本加载失败（宿主据此累计并断闸）=====
+            "report_load_failure" -> {
+                requirePackageUidMatches(packageName, callingUid)
+                val src = extras?.getString("src") ?: "unknown"
+                IpcManager.reportLoadFailure(packageName, src)
+                Bundle().apply { putBoolean("success", true) }
+            }
+
             "register_ipc" -> {
                 requirePackageUidMatches(packageName, callingUid)
                 val binder: IBinder? = extras?.getBinder(IPC_BINDER_KEY)

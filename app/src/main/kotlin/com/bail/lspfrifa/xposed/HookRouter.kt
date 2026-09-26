@@ -45,10 +45,30 @@ import java.util.concurrent.atomic.AtomicLong
 class HookRouter(
     private val targetPackage: String,
     private val targetLoader: ClassLoader,
-    private val appContext: Context? = null,
+    appContext: Context? = null,
     private val hooker: (Executable) -> XposedInterface.HookBuilder,
-    private val hostLog: (String) -> Unit,
+    hostLog: (String) -> Unit,
 ) {
+    /**
+     * D2：这两个依赖在提前阶段拿不到（无 Context），因此可在 Application 阶段经
+     * [attachRuntime] 补上。其余字段（loader/hooker）提前阶段就有，保持 val。
+     */
+    @Volatile
+    private var appContext: Context? = appContext
+
+    @Volatile
+    private var hostLog: (String) -> Unit = hostLog
+
+    /**
+     * D2：接管时注入运行期依赖（Application 上下文 + 日志上行通道）。
+     * 专为“onPackageReady 先建、Application 阶段接管”设计，只补缺不重建 ——
+     * 重建会丢掉已挂的 hook 手柄。
+     */
+    fun attachRuntime(context: Context?, log: (String) -> Unit) {
+        // 注意：参数名不能与属性同名，否则赋值会砸到参数上（Kotlin 参数不可变 = 编译错误）
+        this.appContext = context
+        this.hostLog = log
+    }
 
     private data class HookRequest(
         val clsName: String,

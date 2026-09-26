@@ -68,21 +68,63 @@ object IpcManager {
      * 向指定目标进程下发并热加载 JS 脚本。
      * 无论目标是否在线，都先持久化，保证冷启动可恢复。
      */
-    fun pushScript(packageName: String, scriptCode: String): Boolean {
-        ScriptStore.saveScript(packageName, scriptCode)
-        val executor = activeTargets[packageName] ?: return false
+    fun pushScript(packageName: String, scriptCode: String): ScriptStore.SaveResult {
+        // D5/D15：尺寸超限在此已拒绝（远程写会静默丢，必须先拦）
+        val saved = ScriptStore.saveScript(packageName, scriptCode)
+        if (saved == ScriptStore.SaveResult.SIZE_EXCEEDED) return saved
+        val executor = activeTargets[packageName]
+        if (executor == null) {
+            // 目标不在线：已保存等待冷启动注入（但框架未连接时目标也读不到）
+            return if (saved == ScriptStore.SaveResult.OK) ScriptStore.SaveResult.LOCAL_ONLY else saved
+        }
         return try {
             executor.loadScript(scriptCode, InjectHintStore.isEnabled())
+            saved
         } catch (e: RemoteException) {
             activeTargets.remove(packageName)
-            false
+            saved
         }
     }
 
     /** 仅持久化脚本，不主动推送（例如编辑器自动保存）。 */
-    fun saveScript(packageName: String, scriptCode: String) {
+    fun saveScript(packageName: String, scriptCode: String): ScriptStore.SaveResult =
         ScriptStore.saveScript(packageName, scriptCode)
+
+    /** D7：导入前备份当前脚本（返回备份键；无脚本则不备份）。 */
+    fun backupScript(packageName: String, scriptCode: String?): String? =
+        ScriptStore.backupScript(packageName, scriptCode)
+
+    /** D7：撤销最近一次导入。 */
+    fun undoImport(packageName: String): Boolean = ScriptStore.undoImport(packageName)
+
+    /** D12：当前失败计数。 */
+    fun failCount(packageName: String): Int = ScriptStore.failCount(packageName)
+
+    /** D12：闸是否断着（UI 展示 + 决定是否允许再次注入）。 */
+    fun isCircuitOpen(packageName: String): Boolean = ScriptStore.isCircuitOpen(packageName)
+
+    /** D12：用户手动合闸（清计数 + 允许重试）。 */
+    fun closeCircuit(packageName: String) = ScriptStore.closeCircuit(packageName)
+
+    /**
+     * D12：目标侧上报的加载失败。达到阀值即断闸。
+     *
+     * 为何在宿主侧做：目标进程的 remote prefs 是只读的，它无法自断；
+     * 而闸必须写进 remote prefs 才能被下一次启动读到 —— 宿主是唯一有写权限的一方。
+     */
+    fun reportLoadFailure(packageName: String, src: String) {
+        val n = ScriptStore.bumpFailCount(packageName)
+        Log.w(TAG, "脚本加载失败上报: pkg=" + packageName + " src=" + src + " count=" + n)
+        if (n >= ScriptStore.CIRCUIT_THRESHOLD && !ScriptStore.isCircuitOpen(packageName)) {
+            ScriptStore.openCircuit(packageName)
+            Log.w(TAG, "已达阀值 " + ScriptStore.CIRCUIT_THRESHOLD + "，已暂停对该目标的注入: " + packageName)
+        }
     }
+
+    fun clearFailCount(packageName: String) = ScriptStore.clearFailCount(packageName)
+
+    /** 框架远程通道是否可用（决定脚本能否下发到目标）。 */
+    fun isRemoteAvailable(): Boolean = ScriptStore.isRemoteAvailable()
 
     fun loadScript(packageName: String): String? = ScriptStore.loadScript(packageName)
 

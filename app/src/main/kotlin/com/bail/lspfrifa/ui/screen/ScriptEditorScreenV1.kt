@@ -7,6 +7,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -35,7 +36,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.content.ClipboardManager
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import com.bail.lspfrifa.data.ScriptImport
+import com.bail.lspfrifa.data.ScriptLibraryStore
 import com.bail.lspfrifa.ipc.IpcManager
+import com.bail.lspfrifa.ipc.ScriptStore
 import com.bail.lspfrifa.ui.component.GlassTopAppBar
 import com.bail.lspfrifa.ui.component.MiuixCodeEditor
 import com.bail.lspfrifa.ui.component.MiuixPageBackground
@@ -53,10 +62,13 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.SmallTopAppBar
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
+import top.yukonga.miuix.kmp.icon.extended.Edit
 import top.yukonga.miuix.kmp.icon.extended.Play
 import top.yukonga.miuix.kmp.icon.extended.Redo
 import top.yukonga.miuix.kmp.icon.extended.Undo
+import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * t7：脚本编辑页 v2 — 全屏工作台（最高审美重构）。
@@ -112,6 +124,68 @@ fun ScriptEditorScreenV1(
         }
     }
 
+    // ---- D6/D7：导入（文件 / 剪贴板 / 撤销） ----
+    val ctx = LocalContext.current
+    var importPreview by remember { mutableStateOf<ScriptImport.Result?>(null) }
+    var showImportSource by remember { mutableStateOf(false) }
+
+    /** 导入内容 → 先展示预览与来源，用户确认后才应用（导入即任意代码执行）。 */
+    fun stageImport(outcome: ScriptImport.Outcome) {
+        when (outcome) {
+            is ScriptImport.Outcome.Ok -> importPreview = outcome.result
+            is ScriptImport.Outcome.Failed -> runHint = when (val f = outcome.reason) {
+                ScriptImport.Failure.Empty -> "导入失败：内容为空"
+                ScriptImport.Failure.Binary -> "导入失败：疑似二进制文件"
+                ScriptImport.Failure.TooLarge -> "导入失败：超过 1MB"
+                is ScriptImport.Failure.ReadError -> "导入失败：" + f.message
+            }
+        }
+    }
+
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        if (uri != null) stageImport(ScriptImport.readUri(ctx, uri))
+    }
+
+    fun importFromClipboard() {
+        val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val text = cm?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString()
+        stageImport(ScriptImport.readText(text, "clipboard.js", ScriptImport.Origin.CLIP))
+    }
+
+    /** 确认导入：备份当前 → 入库（去重）→ 覆盖应用。 */
+    fun applyImport(preview: ScriptImport.Result) {
+        scope.launch {
+            val backup = withContext(Dispatchers.IO) { IpcManager.backupScript(packageName, script) }
+            val id = withContext(Dispatchers.IO) {
+                ScriptLibraryStore.add(preview.suggestedName, preview.code, preview.origin).first
+            }
+            script = preview.code
+            val saved = withContext(Dispatchers.IO) { IpcManager.saveScript(packageName, script) }
+            importPreview = null
+            runHint = when (saved) {
+                ScriptStore.SaveResult.OK ->
+                    "已导入并应用（库 " + id.takeLast(6) + (if (backup != null) "，可撤销" else "") + "）"
+                ScriptStore.SaveResult.LOCAL_ONLY -> "已导入（仅本地）：框架未连接，激活后自动下发"
+                ScriptStore.SaveResult.SIZE_EXCEEDED -> "已入库，但超出下发上限 400KB"
+                ScriptStore.SaveResult.REMOTE_REJECTED -> "已入库，但框架拒绝写入（容量已满）"
+            }
+        }
+    }
+
+    fun undoImport() {
+        scope.launch {
+            val ok = withContext(Dispatchers.IO) { IpcManager.undoImport(packageName) }
+            if (ok) {
+                script = withContext(Dispatchers.IO) { IpcManager.loadScript(packageName) } ?: script
+                runHint = "已撤销导入，恢复上一版"
+            } else {
+                runHint = "没有可撤销的导入"
+            }
+        }
+    }
+
     fun pushScript() {
         scope.launch {
             val alive = withContext(Dispatchers.IO) { IpcManager.isTargetAlive(packageName) }
@@ -120,10 +194,16 @@ fun ScriptEditorScreenV1(
                 runHint = "目标进程未连接，脚本已保存等待注入"
                 return@launch
             }
-            val ok = runCatching {
+            val result = runCatching {
                 withContext(Dispatchers.IO) { IpcManager.pushScript(packageName, script) }
-            }.getOrDefault(false)
-            runHint = if (ok) "脚本热更新成功" else "脚本加载失败，请检查日志"
+            }.getOrNull()
+            runHint = when (result) {
+                ScriptStore.SaveResult.OK -> "脚本热更新成功"
+                ScriptStore.SaveResult.LOCAL_ONLY -> "仅存本地：框架未连接，激活后自动下发"
+                ScriptStore.SaveResult.SIZE_EXCEEDED -> "脚本超限（上限 400KB），已拒绝"
+                ScriptStore.SaveResult.REMOTE_REJECTED -> "框架拒绝写入（容量已满），请缩小脚本"
+                null -> "脚本加载失败，请检查日志"
+            }
         }
     }
 
@@ -146,6 +226,9 @@ fun ScriptEditorScreenV1(
                         }
                     },
                     actions = {
+                        // D6：导入入口。图标先用已验证存在的 MiuixIcons.Edit
+                        // （导入专用图标未经三查，待 UI 二轮替换；禁用未核对图标是本项目纪律）
+                        ToolbarIcon(MiuixIcons.Edit, "导入脚本") { showImportSource = true }
                         ToolbarIcon(MiuixIcons.Undo, "撤销") { editorRef?.undo() }
                         ToolbarIcon(MiuixIcons.Redo, "重做") { editorRef?.redo() }
                         Spacer(Modifier.width(4.dp))
@@ -222,6 +305,57 @@ fun ScriptEditorScreenV1(
             }
         }
     }
+
+    // ---- D6/D7：导入相关弹窗（挂函数顶层，不与任何 lambda 嵌套） ----
+    if (showImportSource) {
+        WindowDialog(
+            show = true,
+            title = "导入脚本",
+            summary = "选择来源；导入后先预览，确认才应用",
+            onDismissRequest = { showImportSource = false },
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        showImportSource = false
+                        filePicker.launch(
+                            arrayOf("text/*", "application/javascript", "application/json", "*/*")
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("从文件导入") }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        showImportSource = false
+                        importFromClipboard()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("从剪贴板导入") }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        showImportSource = false
+                        undoImport()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) { Text("撤销上次导入") }
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+    }
+
+    importPreview?.let { preview ->
+        ImportPreviewDialog(
+            preview = preview,
+            onConfirm = { applyImport(preview) },
+            onDismiss = { importPreview = null },
+        )
+    }
 }
 
 private enum class HintTone { Info, Warn }
@@ -275,5 +409,56 @@ private fun ToolbarIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, d
             contentDescription = desc,
             tint = MiuixTheme.colorScheme.onSurfaceSecondary,
         )
+    }
+}
+
+/** D7：导入预览弹窗（内容预览 + 来源 + 警告 + 确认/取消）。 */
+@Composable
+private fun ImportPreviewDialog(
+    preview: ScriptImport.Result,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val head = preview.code.lineSequence().take(12).joinToString("\n")
+    WindowDialog(
+        show = true,
+        title = "导入脚本",
+        summary = preview.suggestedName + "  ·  " + preview.bytes + " 字节",
+        onDismissRequest = onDismiss,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                "来源：" + preview.origin,
+                fontSize = 11.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            )
+            preview.warnings.forEach { w ->
+                Text("⚠ " + w, fontSize = 11.sp, color = MiuixTheme.colorScheme.error)
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                head,
+                fontSize = 11.sp,
+                color = MiuixTheme.colorScheme.onSurfaceSecondary,
+                maxLines = 12,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "将覆盖当前脚本（旧版已自动备份，可撤销）",
+                fontSize = 11.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Button(onClick = onDismiss, modifier = Modifier.weight(1f)) { Text("取消") }
+                Button(onClick = onConfirm, modifier = Modifier.weight(1f)) { Text("导入并应用") }
+            }
+        }
     }
 }

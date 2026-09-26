@@ -2,6 +2,7 @@ package com.bail.lspfrifa
 
 import android.app.Application
 import com.bail.lspfrifa.data.InjectHintStore
+import com.bail.lspfrifa.data.ScriptLibraryStore
 import com.bail.lspfrifa.data.ThemeModeStore
 import com.bail.lspfrifa.ipc.LogStore
 import com.bail.lspfrifa.ipc.ScriptStore
@@ -20,6 +21,7 @@ class LSPFRIFAApplication : Application(), XposedServiceHelper.OnServiceListener
         super.onCreate()
         ThemeModeStore.init(this)
         ScriptStore.init(this)
+        ScriptLibraryStore.init(this)
         InjectHintStore.init(this)
         LogStore.init(this)
         XposedServiceHelper.registerListener(this)

@@ -50,11 +50,21 @@ for f in $files; do
   fi
 done
 
-# 7. 括号平衡（排除字符串噪音不保证，仅提示）
+# 7. 括号平衡（仅提示）
+# 已修正（2026-09-26）：先剔除**字符字面量** '{' / '}' —— 本项目已实证该误报
+# （ScriptImport.kt 的 LBRACE/RBRACE 常量曾致 30/29 假阳性，浪费人工排查）。
 for f in $files; do
-  ob=$(grep -o '{' "$f" | wc -l); cb=$(grep -o '}' "$f" | wc -l)
-  po=$(grep -o '(' "$f" | wc -l); pc=$(grep -o ')' "$f" | wc -l)
+  src=$(sed -e "s/'{'//g" -e "s/'}'//g" "$f")
+  ob=$(printf '%s' "$src" | grep -o '{' | wc -l); cb=$(printf '%s' "$src" | grep -o '}' | wc -l)
+  po=$(printf '%s' "$src" | grep -o '(' | wc -l); pc=$(printf '%s' "$src" | grep -o ')' | wc -l)
   if [ "$ob" != "$cb" ]; then echo "⚠️ 花括号不平衡: $f {{$ob/$cb}}"; fi
+  # 圆括号检查默认关闭：本仓库 30 个 kt 中已有 2 处确定性误报
+  # （JavaBridgeBundle.kt 正则串 `[^)]`；SettingsScreenV093.kt 注释里全角`（`配半角`)`），
+  # 而历史真实 bug 全部由"花括号净值 + 未导入符号"捕获 → 圆括号噪声大于收益。
+  # 需要时：LSPFRIFA_CHECK_PARENS=1 bash tools/check-kt.sh
+  if [ "${LSPFRIFA_CHECK_PARENS:-0}" = "1" ] && [ "$po" != "$pc" ]; then
+    echo "⚠️ 圆括号不平衡: $f (($po/$pc))"
+  fi
 done
 
 if [ "$issues" -eq 0 ]; then echo "✅ 已知坑扫描通过（0 规则命中，规则库=padding混搭/ImageVector包/token误用/sora假API/runCatching包Composable/import区污染）"; else

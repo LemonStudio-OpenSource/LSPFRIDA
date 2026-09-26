@@ -39,6 +39,20 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
         persist(_addedProjects.value.filterNot { it.packageName == packageName })
     }
 
+    /**
+     * 删除项目（详情页右上角）：移除列表 + 停用注入 + 卸载目标进程已加载脚本。
+     * 脚本内容保留（ScriptStore 不删，重新添加即恢复）；副作用与 setEnabled(false) 同构（IO 线程）。
+     */
+    fun deleteProject(packageName: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                IpcManager.disableTarget(packageName)
+                IpcManager.stopScript(packageName)
+            }
+            persist(_addedProjects.value.filterNot { it.packageName == packageName })
+        }
+    }
+
     /** 切换启用开关（持久化，并同步写 ScriptStore——模块冷启动 is_target_enabled 的数据源）。 */
     fun setEnabled(packageName: String, enabled: Boolean) {
         val current = _addedProjects.value

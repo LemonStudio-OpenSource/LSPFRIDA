@@ -72,6 +72,8 @@ class TargetIpcServer(
     /** 模块侧工具日志：本地 logcat + 上行宿主 UI（复用 onLog 通道），供 HookRouter 命中/ARM/MISS 回传。 */
     fun hostLog(message: String) {
         Log.i("LSPFRIFA-Hook", "[$targetPackage] $message")
+        // D14：宿主未上线时进 ring buffer，握手后由 registerLogReceiver 一次性补发
+        EarlyLogBuffer.add(message)
         try {
             logReceiver?.onLog(targetPackage, message)
         } catch (e: RemoteException) {
@@ -123,6 +125,10 @@ class TargetIpcServer(
             } catch (_: Throwable) {}
             logReceiver = receiver
             if (receiver != null) {
+                // D14：宿主日志通道首次建立 —— 补发握手前的早期注入日志（幂等，仅首次生效）
+                EarlyLogBuffer.flush { line ->
+                    runCatching { receiver.onLog(targetPackage, line) }
+                }
                 try {
                     receiver.asBinder().linkToDeath(hostDeathRecipient, 0)
                 } catch (t: Throwable) {

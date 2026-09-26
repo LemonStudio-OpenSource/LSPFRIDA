@@ -33,6 +33,8 @@ import com.bail.lspfrifa.ui.component.UiTokens
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CircularProgressIndicator
+import top.yukonga.miuix.kmp.basic.DropdownImpl
+import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.InputField
@@ -41,11 +43,14 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
+import top.yukonga.miuix.kmp.icon.extended.Sort
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 「选择项目」全屏二级页：
- * 异步扫描全部已安装应用，顶部搜索框，点击未添加项 → 写入 addedProjectList 并 popBackStack。
+ * 异步扫描全部已安装应用，顶部搜索框，右上角排序菜单（应用名/包名/安装时间/更新时间/
+ * 倒序 + 隐藏系统应用），点击未添加项 → 写入 addedProjectList 并 popBackStack。
  */
 @Composable
 fun SelectProjectScreenV2(
@@ -56,6 +61,33 @@ fun SelectProjectScreenV2(
     onBack: () -> Unit,
 ) {
     var query by remember { mutableStateOf("") }
+    var sortMode by remember { mutableStateOf(SortMode.Name) }
+    var descending by remember { mutableStateOf(false) }
+    var hideSystem by remember { mutableStateOf(false) }
+    var showSortMenu by remember { mutableStateOf(false) }
+
+    // 派生列表：隐藏系统应用过滤 → 搜索过滤 → 排序（含倒序）。纯 UI 层派生，data 不变。
+    val visibleApps = remember(appsState, query, sortMode, descending, hideSystem) {
+        if (appsState !is AppsUiState.Success) emptyList()
+        else {
+            val comparator = when (sortMode) {
+                SortMode.Name -> compareBy<InstalledApp> { it.name.lowercase() }
+                SortMode.Package -> compareBy<InstalledApp> { it.packageName.lowercase() }
+                SortMode.Install -> compareBy<InstalledApp> { it.installTime }
+                SortMode.Update -> compareBy<InstalledApp> { it.updateTime }
+            }
+            appsState.apps
+                .asSequence()
+                .filter { !hideSystem || !it.isSystem }
+                .filter {
+                    query.isBlank() ||
+                        it.name.contains(query, true) ||
+                        it.packageName.contains(query, true)
+                }
+                .sortedWith(if (descending) comparator.reversed() else comparator)
+                .toList()
+        }
+    }
 
     Scaffold(
         containerColor = MiuixPageBackground(),
@@ -66,6 +98,15 @@ fun SelectProjectScreenV2(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(imageVector = MiuixIcons.Back, contentDescription = "返回")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = { showSortMenu = true }) {
+                        Icon(
+                            imageVector = MiuixIcons.Sort,
+                            contentDescription = "排序与过滤",
+                            tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
                     }
                 },
             )
@@ -98,18 +139,12 @@ fun SelectProjectScreenV2(
                     onRetry,
                 )
                 is AppsUiState.Success -> {
-                    val filtered = appsState.apps
-                        .filter {
-                            query.isBlank() ||
-                                it.name.contains(query, true) ||
-                                it.packageName.contains(query, true)
-                        }
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
                         verticalArrangement = Arrangement.spacedBy(UiTokens.CardSpacing),
                         contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
                     ) {
-                        items(filtered, key = { it.packageName }) { app ->
+                        items(visibleApps, key = { it.packageName }) { app ->
                             val added = app.packageName in addedPackages
                             SelectableAppCard(
                                 app = app,
@@ -122,7 +157,62 @@ fun SelectProjectScreenV2(
             }
         }
     }
+
+    // 排序菜单（Miuix 原生弹窗 + DropdownImpl(dialogMode) 行，MIUI 选单风格）：
+    // 排序维度 × 4（单选）→ 倒序（toggle）→ 分隔线 → 隐藏系统应用（toggle 不关闭菜单）
+    WindowDialog(
+        show = showSortMenu,
+        title = "排序",
+        onDismissRequest = { showSortMenu = false },
+    ) {
+        Column {
+            SortMode.entries.forEachIndexed { index, mode ->
+                DropdownImpl(
+                    text = mode.label,
+                    optionSize = SORT_MENU_ITEM_COUNT,
+                    isSelected = sortMode == mode,
+                    index = index,
+                    dialogMode = true,
+                ) {
+                    sortMode = mode
+                    showSortMenu = false
+                }
+            }
+            DropdownImpl(
+                text = "倒序",
+                optionSize = SORT_MENU_ITEM_COUNT,
+                isSelected = descending,
+                index = SortMode.entries.size,
+                dialogMode = true,
+            ) {
+                descending = !descending
+                showSortMenu = false
+            }
+            HorizontalDivider(modifier = Modifier.padding(horizontal = 12.dp))
+            DropdownImpl(
+                text = "隐藏系统应用",
+                optionSize = SORT_MENU_ITEM_COUNT,
+                isSelected = hideSystem,
+                index = SortMode.entries.size + 1,
+                dialogMode = true,
+            ) {
+                hideSystem = !hideSystem
+                // toggle 不关闭菜单：保留 ✓ 状态反馈，点外部/返回关闭
+            }
+        }
+    }
 }
+
+/** 选择页排序维度（与 LSPosed 作用域选择菜单一致）。 */
+private enum class SortMode(val label: String) {
+    Name("应用名"),
+    Package("包名"),
+    Install("安装时间"),
+    Update("更新时间"),
+}
+
+/** 排序菜单总行数（4 维度 + 倒序 + 隐藏系统应用），用于 DropdownImpl 首尾间距计算。 */
+private const val SORT_MENU_ITEM_COUNT = 6
 
 @Composable
 private fun LoadingSelectState(modifier: Modifier) {

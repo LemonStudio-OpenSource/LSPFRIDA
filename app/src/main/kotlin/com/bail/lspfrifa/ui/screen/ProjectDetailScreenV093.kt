@@ -39,6 +39,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
+import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
@@ -49,12 +50,14 @@ import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.ChevronForward
+import top.yukonga.miuix.kmp.icon.extended.Delete
 import top.yukonga.miuix.kmp.icon.extended.Edit
 import top.yukonga.miuix.kmp.icon.extended.Layers
 import top.yukonga.miuix.kmp.icon.extended.ListView
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.PressFeedbackType
+import top.yukonga.miuix.kmp.window.WindowDialog
 import com.bail.lspfrifa.ui.component.MiuixPageBackground
 
 /**
@@ -69,12 +72,19 @@ fun ProjectDetailScreenV093(
     onBack: () -> Unit,
     onOpenEditor: () -> Unit = {},
     onOpenLogs: () -> Unit = {},
+    onDeleteProject: () -> Unit = {},
+    onOpenLibrary: () -> Unit = {},
 ) {
     // 初始值从 ScriptStore 读（模块冷启动是目标查询数据源），保证详情页与列表/模块一致
     var enabled by remember(packageName) { mutableStateOf(IpcManager.isTargetEnabled(packageName)) }
     var connected by remember { mutableStateOf(false) }
     // t6：作用域申请结果反馈（原写入日志流，日志已迁移至 LogScreen，此处以行内提示展示）
     var scopeHint by remember { mutableStateOf<String?>(null) }
+    // 删除确认弹窗（右上角删除图标 → Miuix WindowDialog）
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    // D12：熔断状态（坏脚本连续失败达阀后宿主断闸，目标不再尝试注入）
+    var circuitOpen by remember { mutableStateOf(IpcManager.isCircuitOpen(packageName)) }
+    var failCount by remember { mutableStateOf(IpcManager.failCount(packageName)) }
     val scope = rememberCoroutineScope()
 
     /** R1.2：向框架申请作用域；回调已投递主线程，结果写入行内提示。 */
@@ -90,6 +100,9 @@ fun ProjectDetailScreenV093(
         while (true) {
             // F3：ping 为跨进程 Binder 调用，放 IO 线程
             connected = withContext(Dispatchers.IO) { IpcManager.isTargetAlive(packageName) }
+            // D12：熔断由目标侧上报驱动，可能在任何时刻断闸，故随连接状态一起轮询
+            circuitOpen = withContext(Dispatchers.IO) { IpcManager.isCircuitOpen(packageName) }
+            failCount = withContext(Dispatchers.IO) { IpcManager.failCount(packageName) }
             delay(3000L)
         }
     }
@@ -108,6 +121,16 @@ fun ProjectDetailScreenV093(
                     navigationIcon = {
                         IconButton(onClick = onBack) {
                             Icon(imageVector = MiuixIcons.Back, contentDescription = "返回")
+                        }
+                    },
+                    actions = {
+                        // 删除项目：右上角图标 → 确认弹窗 → onDeleteProject（移除+停用+卸脚本）
+                        IconButton(onClick = { showDeleteConfirm = true }) {
+                            Icon(
+                                imageVector = MiuixIcons.Delete,
+                                contentDescription = "删除项目",
+                                tint = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
                         }
                     },
                 )
@@ -159,6 +182,31 @@ fun ProjectDetailScreenV093(
                 Spacer(Modifier.height(4.dp))
                 Text(it, fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
             }
+            // D12 熔断提示（阻断性状态）
+            if (circuitOpen) {
+                Spacer(Modifier.height(12.dp))
+                Card(modifier = Modifier.fillMaxWidth(), cornerRadius = UiTokens.CardRadius) {
+                    Text("已暂停注入", fontSize = 14.sp, fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.error)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "脚本连续 " + failCount + " 次加载失败，已停止对该应用的注入尝试，以免每次启动都受影响。修复脚本后点「恢复」。",
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                withContext(Dispatchers.IO) { IpcManager.closeCircuit(packageName) }
+                                circuitOpen = false
+                                failCount = 0
+                                scopeHint = "[+] 已恢复注入，下次启动目标时生效"
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("恢复注入") }
+                }
+            }
             Spacer(Modifier.height(12.dp))
             // 插件开关卡（Miuix SwitchPreference 行内 switch 规格 + icon 圆底：startAction 实核可用）
             Card(modifier = Modifier.fillMaxWidth(), cornerRadius = UiTokens.CardRadius) {
@@ -205,8 +253,47 @@ fun ProjectDetailScreenV093(
                 summary = "运行日志 · 实时流",
                 onClick = onOpenLogs,
             )
+            Spacer(Modifier.height(10.dp))
+            // D8：脚本库入口（导入的脚本在此管理；从本页进入才能直接应用到当前目标）
+            EntryRowCard(
+                icon = MiuixIcons.Layers,
+                title = "脚本库",
+                summary = "已导入脚本 · 应用 / 删除",
+                onClick = onOpenLibrary,
+            )
             Spacer(Modifier.height(14.dp))
         }
+        }
+    }
+
+    // 删除确认弹窗（Miuix 原生弹窗视觉；确认后执行删除并返回列表）
+    WindowDialog(
+        show = showDeleteConfirm,
+        title = "删除项目",
+        summary = "将从列表移除并停止注入（脚本内容保留，重新添加可恢复）",
+        onDismissRequest = { showDeleteConfirm = false },
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Button(
+                    onClick = { showDeleteConfirm = false },
+                    modifier = Modifier.weight(1f),
+                ) { Text("取消") }
+                Button(
+                    onClick = {
+                        showDeleteConfirm = false
+                        onDeleteProject()
+                    },
+                    modifier = Modifier.weight(1f),
+                ) { Text("删除") }
+            }
         }
     }
 }

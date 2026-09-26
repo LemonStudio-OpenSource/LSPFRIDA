@@ -17,6 +17,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -30,6 +31,9 @@ import androidx.navigation.compose.rememberNavController
 import com.bail.lspfrifa.data.AddedProject
 import com.bail.lspfrifa.data.AppsUiState
 import com.bail.lspfrifa.data.AppsViewModel
+import com.bail.lspfrifa.data.PendingImport
+import com.bail.lspfrifa.ui.screen.ImportTargetScreen
+import com.bail.lspfrifa.ui.screen.ScriptLibraryScreen
 import com.bail.lspfrifa.data.ProjectViewModel
 import com.bail.lspfrifa.data.ThemeModeStore
 import com.bail.lspfrifa.ipc.IpcManager
@@ -71,6 +75,9 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // D6：分享进入——必须在 Intent 授权有效期内读完内容（见 PendingImport 注释），
+        // 故在 super.onCreate 之前捕获；UI 层稍后经 PendingImport.take() 取用。
+        PendingImport.capture(this, intent)
         // 沉浸模式：必须在 super.onCreate() 或 setContent 之前调用。
         // 显式禁用三键导航的系统白 scrim（navigationBar），让底部手势区透出应用背景，
         // 避免底栏下方白条；statusBar 用 auto（透明+按主题图标）。
@@ -137,6 +144,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** D6：热启动时收到新的分享 Intent（activity 已存在）。 */
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        PendingImport.capture(this, intent)
+    }
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         // 白条回归防护（reviewer 从 androidx.activity 源码确认）：enableEdgeToEdge 在 API29+
@@ -154,6 +167,14 @@ class MainActivity : ComponentActivity() {
     ) {
         val navController = rememberNavController()
         val framework by FrameworkState.status.collectAsState()
+        val projects by projectViewModel.addedProjects.collectAsState()
+
+        // D6：分享进入的脚本在本进程内待处理 —— 拉起「导入到哪」页。
+        // 内容已在 onCreate/onNewIntent 捕获解析完毕（原始 Uri 已不依赖）。
+        var sharedImport by remember { mutableStateOf(PendingImport.take()) }
+        LaunchedEffect(sharedImport) {
+            if (sharedImport != null) navController.navigate("import_target")
+        }
 
         // 根容器不铺背景：背景由各页 Scaffold 的默认 surface 统一负责；
         // 此前叠加 background 与 surface 不同色，被透出时形成色差灰带
@@ -218,6 +239,14 @@ class MainActivity : ComponentActivity() {
                     onOpenLogs = {
                         navController.navigate("logs/${android.net.Uri.encode(pkg)}?name=${android.net.Uri.encode(name)}")
                     },
+                    // 删除项目：ViewModel 层做移除+停用+卸脚本（IO 线程），随后返回项目列表
+                    onDeleteProject = {
+                        projectViewModel.deleteProject(pkg)
+                        navController.popBackStack()
+                    },
+                    onOpenLibrary = {
+                        navController.navigate("script_library/" + android.net.Uri.encode(pkg) + "?name=" + android.net.Uri.encode(name))
+                    },
                 )
             }
             composable(
@@ -255,6 +284,45 @@ class MainActivity : ComponentActivity() {
                     packageName = pkg,
                     onBack = { navController.popBackStack() },
                 )
+            }
+            composable(
+                route = "script_library/{pkg}?name={name}",
+                arguments = listOf(
+                    androidx.navigation.navArgument("pkg") { type = androidx.navigation.NavType.StringType },
+                    androidx.navigation.navArgument("name") {
+                        type = androidx.navigation.NavType.StringType
+                        defaultValue = ""
+                    },
+                ),
+            ) { entry ->
+                val pkg = entry.arguments?.getString("pkg").orEmpty()
+                val name = entry.arguments?.getString("name").orEmpty()
+                ScriptLibraryScreen(
+                    targetPackage = pkg,
+                    targetName = name.ifBlank { pkg },
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            composable("import_target") {
+                val item = sharedImport
+                if (item == null) {
+                    // 状态丢失（进程重建等）——安全回退到主页，不报错
+                    LaunchedEffect(Unit) { navController.popBackStack() }
+                } else {
+                    ImportTargetScreen(
+                        preview = item.result,
+                        projects = projects,
+                        onDone = {
+                            sharedImport = null
+                            navController.popBackStack()
+                        },
+                        onBack = {
+                            PendingImport.clear()
+                            sharedImport = null
+                            navController.popBackStack()
+                        },
+                    )
+                }
             }
         }
         }

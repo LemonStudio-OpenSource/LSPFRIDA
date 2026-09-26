@@ -295,7 +295,7 @@ register_ipc 会拉起宿主进程因此宿主通常在场。
 - 路由共 7 条（main / select_project / project_detail / script_editor / logs / script_library / import_target），嵌套逐行核对无误
 
 ### 仍未交付
-- ~~工作流 3~~ ✅ 本第四轮完成；工作流 4（类加载感知）仍未动
+- ~~工作流 3~~ ✅；~~工作流 4（类加载感知）~~ ✅ `f069e7f`（代码层面；编译与真机未验证）
 - 模块化拼装（`modules.<pkg>` 已建键但未接入注入链）——用户已明确暂缓，`setModules`/`enabledModules` 暂为未调用
 - **D5 尺寸阀值真机实测**（200KB / 500KB / 900KB / 1.2MB）——需用户侧
 - 熔断链路的真机验证（本轮为静态实现，未跑过真机）
@@ -343,9 +343,65 @@ register_ipc 会拉起宿主进程因此宿主通常在场。
 - 新增日志（供真机验证）：`early_router_ready` / `early_script_loaded` / `early_no_script` / `early_check_skip` / `early_circuit_open_skip` / `early_router_taken_over` / `skip_reload_early_loaded`
 
 ### 仍未交付
-- 工作流 4（类加载感知 / 三级再武装）
 - 模块化拼装（已暂缓）
 - 所有真机验证（含本轮提前注入、D5 尺寸阀值、熔断链路）
+
+### 第五轮交付（工作流 4：类加载感知 / 三级再武装）
+
+commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限制：
+**LSPlant 要求 ArtMethod 已存在，类未加载时 hook 请求只能 MISS**。
+
+#### 三级实现
+| 级 | 触发 | 成本 | 状态 |
+|---|---|---|---|
+| ① 锚点 flush | `onPackageReady` 路由就绪后；`callApplicationOnCreate` 拦截内、proceed 之前 | 队列空时≈0 | 代码到，未真机验证 |
+| ② Kotlin 轮询 | 队列非空起守护线程，200ms；队列空即退出；上限 600 tick（≈2min） | 仅队列非空时 | 代码到，未真机验证 |
+| ③ loadClass 监听 | hook `ClassLoader.loadClass(String,boolean)`，proceed **之后**处理 | 稳态=一次 isEmpty() | 激进模式，**默认关**，设置项可开 |
+
+#### 五条安全纪律（逐条对应实现，均来自本轮自查）
+1. **轮询线程必须全包异常**：安卓任意线程未捕获异常会杀掉**整个目标进程**。
+   → `try/catch(Throwable)/finally`，绝不外抛（`POLL_ERR` 日志）。
+2. **绝不允许双重出队**：`ConcurrentHashMap` 迭代器连续两次 `remove()`（中间无 `next()`）抛 ISE，
+   而其中一条路径暴露在目标主线程上 → `flushPending` 重构为两阶段（先解析，成功才出队）。
+3. **loadClass 处理必须在 proceed 之后**，并经 `mainHandler.post` 投递：
+   安装 hook 本身会加载类，与当前加载共用 per-loader 锁 —— 同步做等于自己抢自己的锁。
+4. **`armOnClass` 必须 @Synchronized**：消息路径与 flush 路径可并发，
+   同时通过 `containsKey` 检查会对同一方法挂两次，后一个 handle 覆盖前一个 → 泄漏且卸不掉。
+5. **锚点预算保守**：`FLUSH_MAX_ITEMS` 16→8。每项可能触发 LSPlant 安装（含 deopt），
+   主线程预算需保守；剩余交给②（非主线程，代价几乎为零）。
+
+#### 实现中的额外修正
+- `unhookByTag` 改用“先筛键再逐个 remove”，不依赖 `entrySet().removeIf` 实现细节。
+- `unhookAll` 同步 `clearPending()` —— 防上一轮脚本的 hook 迟到生效。
+- 类加载监听手柄**单独持有**（不进 `handles`）：它不是脚本注册的 hook，
+  不应随脚本重载被 `unhookAll` 卸掉；必须强引用持住防 GC。
+
+#### 新增文件
+- `data/HookModeStore.kt`（54 行）：设置项存储，与 `InjectHintStore` 同构，
+  写 `lspfrifa_config` 组下发（目标进程只读）。键 `loadclass_watch`，**默认关**。
+
+#### 真机核验点（新增日志关键字）
+`MISS_CLASS_QUEUED` / `ARMED_LATE src=anchor|poll|loadclass` / `POLL_GIVEUP` /
+`POLL_ERR` / `LATE_ARM_ERR` / `PENDING_CLEARED` /
+`CLASSLOADER_WATCH_ON|OFF|FAIL` / `loadclass_watch_requested`
+
+#### ⚠️ 本轮的诚实声明
+- **编译未验证**：最后一次成功构建在 07:32（W3 之前）；W4 代码（含新文件 HookModeStore）尚未编译过。
+- **真机未验证**：三级逻辑一次都没在设备上跑过。
+- `uninstallClassLoaderWatcher()` 已定义但**当前无调用方**（预留给“开关关闭后即时卸载”，
+  但按 D13 不改 AIDL，运行期关闭只能下次注入生效，故暂未接）。
+
+### 四个工作流全部完成（代码层面）
+| 工作流 | 内容 | commit |
+|---|---|---|
+| W1 | D4 解耦 Provider + D15 remote prefs 分组 | `ab28c4d` 含 |
+| W2 | D6 导入四通道 + D7 备份撤销 + D8/D9 脚本库 + D12 熔断 | `ab28c4d` 含 |
+| W3 | onPackageReady 提前注入 | `ab28c4d` 含 |
+| W4 | D3 类加载感知（三级再武装） | `f069e7f` |
+| 编译警告修复 | err 解析语义 + componentType 类型安全 | `1cdddea` |
+
+**模块化拼装仍暂缓**（用户明确）；`setModules`/`enabledModules` 仍未调用。
+
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 
 - **工作流 1**：宿主冷启动前先启动目标 → 脚本应仍注入成功（`load_persisted_script src=remote_prefs`）；

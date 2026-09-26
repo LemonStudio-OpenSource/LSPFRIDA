@@ -244,7 +244,53 @@
       "attemptId": "76596282-3019-47a2-a9f8-4b006acfd791",
       "reassigning": false,
       "output": "t15 B2 实施完成（3 文件 diff + 双绿自检 + 1 个额外语义修复）。\n\n【GumJsBridge.kt（LSP_SHIM_JAVA）】①新增 __lspEncodeArg/__lspEncodeArgs（B2 参数编码：基础类型直 JSON、数组递归、占位/其它对象→{\"__obj\":...}）；②__lspInnerBridge 改为接收 ...args → send({t:\"lsp.rpc_inner\", id, args:编码数组})（空数组=未提供）；③__lspMethodWrapper 新增 overload(...sigs)：selKey=&lt;cls&gt;#&lt;method&gt;#&lt;sigs 逗号串&gt;；lsp.hook 注册消息新增可空 sigs 字段；implementation=null → unhook（selKey）；重复赋值先 unhook（与 default 同构）；④**语义修复**：__lspHookOriginalReply 解包 __ret（用户 `return this.bar(a)` 拿原始结果而非 {\"__ret\":...} 包装——原实现会让 Kotlin CAST_FAIL 并二次 proceed）。\n\n【HookRouter.kt】①HookRequest.sigs（optJSONArray 解析，可空）；②handle()：sigs 过滤（normalizeSig 归一化 'I'/'int'/'java.lang.String'/'int[]'/'[I' 等形态 → JVM 描述符；descriptorOf 对 parameterTypes 匹配；无命中 log MISS_OVERLOAD）；③interceptReplace 内层循环：args 非空且 decodeArgs 按 parameterTypes 转换成功 → chain.proceed(convArgs)，否则安全回退原参 proceed()（对象占位/类型不符 → 回退原参，符合 cap 裁定）；④**防二次执行修复**：innerExecuted+lastInnerResult 记录——超时/over=false/JS_ERR/CAST_FAIL/DECODE_ERR 各回退分支在内层已执行时复用原方法结果，不再二次 chain.proceed()（frida 惯用 `return this.method(a)` / `await this.method(a); 返回 undefined` 两种模式均单次执行）；⑤ARMED 日志加 sigs。\n\n【gumjs_bridge.cpp】①LspPending 加 inner_args（JSON 数组文本）；②handle_rpc_inner 提取 payload.args（node_to_json）→ 透传存储（诊断日志加 args=yes/no）；③nativeCallJs 内层返回 {\"__inner\":true,\"args\":<json>}/无 args 保持原 marker；④pending_free/clear_all 释放 inner_args。\n\n【自检全绿】node --check（shim 3 文件：base/java/combined）+ vm 自检 10/10 PASS（default-hook 无 sigs / overload-hook sigs+selKey / overload-null unhook / inner args 编码 [7,\"hi\",null] / __ret 解包透传 r=1 / 对象占位透传 / observe-after-inner / 复赋值重注册）+ check-kt.sh 双绿（0 规则命中 + 0 未导入符号）。\n\n【协议不变量】lsp.hook 新增字段 sigs（可空，缺省=现状挂全部）；lsp.rpc_inner 新增 args（可空数组；cpp 缺省 → Kotlin 原参回退）；其余字段/流程零改动——B1 观察/替换/嵌套/超时兜底逻辑保留原样（仅两处回退分支改为复用 lastInnerResult 防二次执行，行为更优）。【域不冲突】loadScript 注入顺序/LSP_SHIM_BASE（t14 注入提示）未触碰；bundle 合并归属（cap 裁定）未触碰。"
+    },
+    {
+      "id": "t16",
+      "subject": "t16 诊断：register_ipc Unknown authority 根因定位",
+      "description": "目标：找出 uitest(）目标进程调用模块 App 的 ScriptConfigProvider（content://com.bail.lspfrifa.config_provider）时抛 \"Unknown authority\" 的根因，输出证据链+置信度。\n\n已知事实（captain 已核）：\n- LSPFRIFAModule.kt:286-303 registerBinderToHost → contentResolver.call(uri, \"register_ipc\", pkg, bundle) 抛 e → log WARN \"event=binder_handshake_deferred pkg=... err=${e.message}\"（L301）。用户日志 err=Unknown authority com.bail.lspfrifa.config_provider。\n- Manifest:38-43 provider ScriptConfigProvider, authorities=${applicationId}.config_provider, exported=true, multiprocess=false。\n- applicationId=com.bail.lspfrifa（与报错一致）。\n- 该 provider 本身跑在模块 App 进程（非目标进程）。\n\n需要你做的：\n1. 读 LSPFRIFAModule.kt 全文（1-180 行：TAG 定义、MODULE_PACKAGE、PROVIDER_URI、runInitChain 调用顺序、log() 实现、getRemotePreferences 等），确认 registerBinderToHost 的调用时机/线程/重试策略。\n2. 读 TargetIpcServer.kt + ScriptConfigProvider.kt + IpcManager.kt（宿主侧）全文，理清\"目标进程→模块 provider\"全部调用点（get_script/register_ipc/is_target_enabled）与失败影响面（在线状态/脚本推送是否降级）。\n3. 判断根因候选并分级（每项给证据+置信度高/中/低）：\n   a) Android 11+ 包可见性：uitest 无 QUERY_ALL_PACKAGES/无 <queries> 声明 com.bail.lspfrifa → 跨包 provider resolve 失败（Unknown authority）。注意：此假设若成立，模块无法修改第三方 target 的 manifest，修复必须换通道或走框架通道。\n   b) 模块 App 进程处于 stopped/force-stop 状态 → provider 不被 AMS 拉起。\n   c) provider 进程启动被安全机制（HyperOS/Android 15）限制。\n   d) 其它（如 authority 拼写/applicationId 差异——注意 gradle 中 applicationId 是否与 MODULE_PACKAGE 常量一致！特别核对 build.gradle.kts applicationId vs LSPFRIFAModule MODULE_PACKAGE vs Manifest ${applicationId}）。\n4. 输出：根因判定（证据行号）、影响面（哪些功能已挂/已降级）、修复方向（改代码/无法改需换通道）、验证方案（用户真机可执行的 logcat 观察点）。不要改代码。",
+      "status": "completed",
+      "assignee": "backend-auditor",
+      "dependencies": [],
+      "attempt": 1,
+      "createdAt": 1787658851381,
+      "updatedAt": 1787659406340,
+      "attemptId": "e9b4f6e8-9201-4dcc-bfa2-7ba6aadbc6f1",
+      "reassigning": false,
+      "output": "t16 诊断完成（只读，未改代码）。\n\n【根因判定（按置信度）】（d）**已证伪**——三重一致：build.gradle.kts L9 namespace=L18 applicationId=com.bail.lspfrifa；LSPFRIFAModule.kt L24 MODULE_PACKAGE / L25 PROVIDER_URI 一致；**构建产物实证**：app-debug.apk 二进制 AndroidManifest（NUL 去除后 grep）含 \"com.bail.lspfrifa.config_provider\"×1 + \"ScriptConfigProvider\"×1——authority/类名/包名无任何拼写漂移。\n\n（b）**高置信度首因：模块 App 处于 stopped/force-stop 状态（或安装后从未打开过）**。证据：①AOSP `ActivityManagerService.getContentProviderImpl` 调用链含 stopped 处理段——\"before/after set stopped state\"、\"Failed trying to unstop package\"（mo4tech 对 API 33 源码的调用点溯源）——provider 包处于 stopped 时系统不发布/不申请该 provider，ContentResolver.acquireProvider 返回 null → 抛出 `UnknownAuthorityException`（消息恰为 \"Unknown authority <authority>\"）；②常见触发路径=LSPosed Manager 变更作用域/激活后 force-stop 模块 App、或 `adb install` 重装（签名变化=删除重装=stopped）后未打开过——与\"uitest 首次注入即报、模块本身开发期被频繁重装\"的时间线吻合；③**旁证**：checkTargetEnabled/loadInitialScript 走远程 prefs 通道成功（模块在 LSPosed 下 getRemotePreferences 可用——LSPFRIFAModule.kt L148/L234），而 register_ipc 是**唯一无框架通道替代、必须走 provider 的调用**（Binder 无法经 prefs 传递）→ 现象只出现在 binder_handshake，完全自洽。\n\n（a）包可见性：**低-中（大概率不是根因）**——官方\"自动可见\"规则：访问某 app 的 provider 会使该 provider 包自动变得对调用方可见（lene-huang Android11 实验实证：app1 直到访问 app3 的 provider 才可见=访问本身成功）；AOSP 溯源显示 getContentProviderImpl 的 resolveContentProvider 在 system 侧执行、无调用方 visibility 过滤（门控对象是 query API 而非运行时绑定）。**但其间接影响确凿**：LSPFRIFAModule.kt L220-227 giveup 诊断的 `resolveContentProvider` 是 visibility 门控 API——目标无声明时即使宿主安装完好也返回 null → **诊断字段 provider_resolved=false 会误导为\"未安装\"，属诊断语义失真（需修正，非本 bug）**。\n\n（c）HyperOS 后台启动限制：**中低**——本地无证据；真机验证项（排除法）。\n\n【影响面】register_ipc 失败 → 宿主 IpcManager.activeTargets 无该目标：在线进程计数/详情页连接状态=\"未连接\"（3s 轮询恒 false）、运行按钮热更=仅保存不推送、TargetIpcServer 实时日志通道=无（LogStore 空）。**未受影响**：冷注入脚本（远程 prefs script.&lt;pkg&gt; → loadInitialScript）、启用检查（远程 prefs）、t14 注入 Toast —— 均框架通道。即：**注入与脚本执行可用，仅\"宿主↔目标实时交互\"降级**。\n\n【修复方向】①非代码（首推）：打开模块 App 一次（clears stopped）+ 避免 LSPosed 作用域变更后不重开；若确认 stopped 理论，无需换通道；②代码（低风险加固）：registerBinderToHost 失败分支区分异常类型日志（UnknownAuthorityException vs SecurityException）+ Host 端首次启动检测（getApplicationInfo/stopped 无法自查——改为宿主导航提示）；③结构性（不建议现在做）：彻底摆脱 provider 需换 Binder 传递机制，框架远程通道（prefs/files）无 Binder 能力，不成立。\n\n【验证方案（用户可执行）】①`adb shell dumpsys package com.bail.lspfrifa | grep -i stopped` → stopped=true 即实证；②打开模块 App → 重启 uitest → `logcat -s LSPFRIFA-Hook` → event=binder_handshake_ok；③`adb shell am force-stop com.bail.lspfrifa` → 复现（实验闭环）；④若打开后仍失败：`adb shell pm list packages | grep bail`（安装确认）、logcat 查 AMS 侧 \"Unable to launch app\" provider 相关、检查 HyperOS 后台运行限制/双用户；⑤观察 register_ipc WARN 的先后：无 target_check_* 相关 WARN（说明远程通道正常）→ 佐证 (b)。"
+    },
+    {
+      "id": "t17",
+      "subject": "t17 修复：binder 握手通道（按 t16 结论）",
+      "description": "按 t16 根因诊断结果实施修复。若根因=目标 App 无包可见性（模块不能改第三方 manifest）→ 修复应换通道或降级策略（如 register_ipc 失败不再 WARN 刷屏、在线状态标注\"provider 不可达\"、脚本拉取完全依赖 remote prefs 通道并确保闭环）；若根因=模块侧可修（provider 注册/进程/时机）→ 直接修模块。修改前先 read 目标文件，改动最小化。完成后自查 diff 与受影响调用链。",
+      "status": "completed",
+      "assignee": "backend-auditor",
+      "dependencies": [
+        "t16"
+      ],
+      "attempt": 1,
+      "createdAt": 1787658984936,
+      "updatedAt": 1787660027191,
+      "attemptId": "b1d5e1e1-8bb9-4ba4-bdf4-e8ec42f8d9c9",
+      "reassigning": false,
+      "output": "t17 修复完成（只改 LSPFRIFAModule.kt registerBinderToHost 区域，单文件；未动 TargetIpcServer/ScriptConfigProvider/HookRouter/JS/cpp）。\n\n【diff 行号清单（基线 L286-303 → 新 L286-373）】\n1. 首次调用保持原始内容（必须抛出以进入分类；原 bundle/call 原位保留）。\n2. catch 三态分类：①message 含 \"Unknown authority\"（ignoreCase）→ WARN event=binder_handshake_deferred + \"[可操作] 模块 App 可能处于停止/被清理状态：请打开 LSPFRIFA 应用一次，等待自动重连\"；②SecurityException → event=binder_handshake_denied + \"[鉴权] Binder 通道被拒绝\"；③其他 → 原文 WARN。单次日志。\n3. 失败路径调用 scheduleBinderReconnect。\n4. 新增 registerIpcCall（静默版 helper，重试路径用；返回 Boolean）。\n5. 新增 scheduleBinderReconnect（守护线程 \"lspfrifa-binder-reconnect\"；10 次×3s，复用 DEFERRED_CHECK_ATTEMPTS/DELAY_MS；成功 → INFO \"event=binder_handshake_recovered pkg=... attempt=N\"；耗尽 → 单条 WARN \"event=binder_reconnect_giveup pkg=... attempts=N\"；InterruptedException 静默退出）。\n\n【IpcManager.registerTarget 重复注册语义（读码确认）】L38-65：同包+同 binder 重复注册=①新 DeathRecipient 再 link（死亡双回调 remove×2 无害）；②registerLogReceiver 再调（目标侧 unlink 旧+重 link 同一 receiver=安全）；③activeTargets 同对象覆盖=幂等。结论：重复注册幂等安全。\n\n【互斥性确认】初始注册失败 ⇒ logReceiver 未建立 ⇒ hostDeathRecipient 未 link ⇒ TargetIpcServer.maybeReconnectToHost 不触发 ⇒ 不与新重试循环重复；恢复成功后由原宿主死亡重连路径接管。两路径串行接力、无死锁（重试线程仅 provider call）。\n\n【自查】check-kt.sh 双绿（0 规则+0 未导入符号；无新 import）；调用链闭环；日志 ≤3 条/目标生命周期；30s 窗口内用户打开模块 App 即自愈（无需重启目标）。\n\n【边界说明】若 t16 判定最终升级为 R1（可见性）——本修复不解决 R1（10 次重试全部失败仅 giveup），但 t16 已报的降级策略（降级文案/P2 prefs 心跳）与本次正交、可并行落地。"
+    },
+    {
+      "id": "t18",
+      "subject": "t18 复核：修复后的状态流/降级闭环检查",
+      "description": "复核 t17 修复：从 UI/状态流视角检查——在线进程列表/脚本推送功能在 provider 不可达时的展示与降级是否闭环（无死锁/无反复 Toast/无\"在线但实际断连\"误导），日志提示是否准确。独立视角给出 通过/建议。",
+      "status": "cancelled",
+      "assignee": "captain",
+      "dependencies": [
+        "t17"
+      ],
+      "attempt": 2,
+      "createdAt": 1787658985058,
+      "updatedAt": 1787660237322,
+      "reassigning": false,
+      "attemptId": "f9c91cc2-570d-43ef-a260-9248d3fd4766",
+      "output": "用户介入：编译/真机验证由用户执行，本复核取消（可随时重新领取）。t16/t17 结论已归档：根因候选 R1 包可见性(高)/R2 stopped(中-低)/R3 HyperOS(中低)；t17 修复已落地（异常分类+10×3s 自动恢复+信息性探针）。"
     }
   ],
-  "taskSeq": 15
+  "taskSeq": 18
 }

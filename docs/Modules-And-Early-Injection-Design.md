@@ -446,6 +446,14 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
   `TargetIpcServer` 构造调用点）；真机未验证。
 - `setHookRouter()` 现已无调用方（保留为公共 API，但主链已不再依赖它）。
 
+#### 追加加固（第二轮，commit `bf8bb6d`）
+1. **cpp 回调线程全局兜底**：两个回调均运行在 cpp `gum-js-loop` 线程，
+   该线程未捕获异常会杀**整个目标进程** → 现所有分支（含 record / EarlyLogBuffer / hostLog）
+   均包在 `runCatching` 内。
+2. **`handleToastMessage` context 缺失语义**：原 `appContext ?: return true` 会把
+   `lsp.toast` 当作“已消费”静默吞掉（提前阶段必然无 Context）→ 现改为 `return false`，
+   让消息走未消费分支入 EarlyLogBuffer 补发（日志：`[lsp-toast] deferred (no context yet)`）。
+
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 
 - **工作流 1**：宿主冷启动前先启动目标 → 脚本应仍注入成功（`load_persisted_script src=remote_prefs`）；

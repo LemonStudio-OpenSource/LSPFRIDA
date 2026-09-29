@@ -428,7 +428,13 @@ class HookRouter(
         } catch (_: Throwable) {
             return false
         }
-        val ctx = appContext ?: return true
+        // 提前注入阶段 appContext 为 null（Context 要到 App 阶段才由 attachRuntime 补上）。
+        // 此时不能 return true（那会把消息“消费掉”，宿主 UI 永远看不到这次请求），
+        // 而要返回 false 让调用方继续走未消费分支（early 回调会入 EarlyLogBuffer 补发）。
+        val ctx = appContext ?: run {
+            hostLog("[lsp-toast] deferred (no context yet) msg=$msg")
+            return false
+        }
         hostLog("[lsp-toast] requested msg=$msg")
         mainHandler.post {
             runCatching {

@@ -218,15 +218,19 @@ class LSPFRIFAModule : XposedModule() {
             // registerLogReceiver 一次性补发（这正是 D14 缓冲存在的意义）。
             GumJsBridge.registerMessageCallback(object : GumJsBridge.OnScriptMessage {
                 override fun onScriptMessage(message: String) {
-                    Log.i("LSPFRIFA-Frida", "[" + targetPackage + "] " + message)
-                    try {
-                        if (earlyRouter?.tryHandle(message) == true) return
-                    } catch (t: Throwable) {
-                        record(Log.WARN, "event=early_dispatch_err err=" + t.message)
+                    // 本回调运行在 cpp 的 gum-js-loop 线程：任意未捕获异常会杀掉**整个目标进程**，
+                    // 故最外层必须全局兜底（record/EarlyLogBuffer 本身也可能在极端情况下抛）。
+                    runCatching {
+                        Log.i("LSPFRIFA-Frida", "[" + targetPackage + "] " + message)
+                        try {
+                            if (earlyRouter?.tryHandle(message) == true) return@runCatching
+                        } catch (t: Throwable) {
+                            record(Log.WARN, "event=early_dispatch_err err=" + t.message)
+                        }
+                        // 未消费（脚本 console.log / 自定义 send / 暂无 context 的 toast）：
+                        // 此时无 logReceiver，不补缓冲就会永久丢失（flush 后 add 为空操作，无重复风险）。
+                        EarlyLogBuffer.add(message)
                     }
-                    // 未消费（脚本 console.log / 自定义 send）：此时无 logReceiver，
-                    // 不补缓冲就会永久丢失（flush 后 add 为空操作，无重复风险）。
-                    EarlyLogBuffer.add(message)
                 }
             })
             record(Log.INFO, "event=early_router_ready pkg=" + targetPackage)

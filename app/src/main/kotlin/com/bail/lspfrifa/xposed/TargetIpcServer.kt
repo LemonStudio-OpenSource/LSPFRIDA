@@ -56,20 +56,24 @@ class TargetIpcServer(
         // 注册脚本消息回调（native on_message -> Kotlin -> Binder 上行）
         GumJsBridge.registerMessageCallback(object : GumJsBridge.OnScriptMessage {
             override fun onScriptMessage(message: String) {
-                // 1. 本地 logcat 备份
-                Log.i("LSPFRIFA-Frida", "[$targetPackage] $message")
-                // 1.5 官方通道路由：LSP.hook 请求被 HookRouter 消费（命中/失败日志经 hostLog 上行）
-                if (hookRouter?.tryHandle(message) == true) return
-                // 2. 跨进程推送宿主 Manager UI
-                //    D14：通道未建立时先入 ring buffer（握手后补发；flush 后 add 为空操作，无重复）。
-                //    为何需要：提前注入下脚本在 TargetIpcServer 构造前就已在跑，
-                //    而本回调注册（构造）到 registerLogReceiver（首次握手）之间存在窗口。
-                EarlyLogBuffer.add(message)
-                try {
-                    logReceiver?.onLog(targetPackage, message)
-                } catch (e: RemoteException) {
-                    Log.w(TAG, "宿主日志通道已断开: ${e.message}")
-                    logReceiver = null
+                // 本回调运行在 cpp 的 gum-js-loop 线程：任意未捕获异常会杀掉**整个目标进程**，
+                // 故最外层必须全局兜底。
+                runCatching {
+                    // 1. 本地 logcat 备份
+                    Log.i("LSPFRIFA-Frida", "[$targetPackage] $message")
+                    // 1.5 官方通道路由：LSP.hook 请求被 HookRouter 消费（命中/失败日志经 hostLog 上行）
+                    if (hookRouter?.tryHandle(message) == true) return@runCatching
+                    // 2. 跨进程推送宿主 Manager UI
+                    //    D14：通道未建立时先入 ring buffer（握手后补发；flush 后 add 为空操作，无重复）。
+                    //    为何需要：提前注入下脚本在 TargetIpcServer 构造前就已在跑，
+                    //    而本回调注册（构造）到 registerLogReceiver（首次握手）之间存在窗口。
+                    EarlyLogBuffer.add(message)
+                    try {
+                        logReceiver?.onLog(targetPackage, message)
+                    } catch (e: RemoteException) {
+                        Log.w(TAG, "宿主日志通道已断开: ${e.message}")
+                        logReceiver = null
+                    }
                 }
             }
         })

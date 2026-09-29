@@ -75,7 +75,9 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 | C9 | 同一次启动内重启目标两次 | `event=early_skip_already pkg=<pkg>`（同一进程内不重复早期注入） |
 | C10 | **关键回归**：早期阶段引擎加载失败时 | `event=early_inject_failed pkg=<pkg> err=...` 或 `event=early_script_load_failed` → **App 阶段必须继续尝试**（`earlyScriptLoaded` 只在成功时置位）→ 最终仍 ARMED |
 | C11 | 全局回归：`EARLY_INJECT_ENABLED = false` 重编译 | 行为**完全等同工作流 3 之前**；日志无 `early_*`。**这是回滚路径，务必验一次** |
-| C12 | 检测平台限制 | 若目标应用 `android:process` 为独立进程/被 LSPosed 作用域排除 → 按设计不注入，非缺陷 |
+| C12 | 检测平台限制 | 若目标应用 android:process 为独立进程/被 LSPosed 作用域排除 → 按设计不注入，非缺陷 |
+| **C13** | **★ 关键：早期脚本的 hook 请求必须被真正处理**。启用目标 + 脚本 hook 一个 framework 类（永远可用），冷启动 | `[lsp-hook] ARMED ...` 应出现在 `event=application_created` **之前**（或至少同一早期阶段），而**不是** “early_script_loaded 出现但永远无 ARMED”。<br>• 为何单列：修复前早期阶段**不注册消息回调**（_messageCallback 仅 TargetIpcServer 构造时赋值），<br>• 早期脚本的 send() 全部静默丢弃，而 App 阶段又因 earlyScriptLoaded 已置位跳过重载 → **hook 永不注册**。<br>• 这是 W3 引入的真实缺陷，修复于本次 fix: 提交；本项就是它的验收口径。 |
+| **C14** | **早期日志不丢**：脚本在最早执行阶段打一条 console.log("EARLY-PROBE")，宿主未运行时冷启动 | 日志面板最终**应出现**该条（早期进 EarlyLogBuffer，握手后由 registerLogReceiver 一次性补发）。<br>• 修复前：早期未消费消息只进 logcat、不入缓冲 → 宿主 UI 永久看不到。 |
 
 ## D. D5 脚本尺寸实测（必须实测，禁止推理代替）
 
@@ -116,7 +118,7 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 
 - **A/B/C/E 全绿 + D 回填完成** → 工作流 1/2/3 正式验收。
 - **W4（D3）验收另见 §I**，其风险独立：即使 A/B/C 未全绿也可先跑 I1–I3（队列基础行为），
-  但 **I5（与提前注入叠加）必须在 C 组通过后再跑** —— 否则一旦异常无法区分是 W3 还是 W4。
+  但 **I15/I16（与提前注入叠加）必须在 C 组通过后再跑** —— 否则一旦异常无法区分是 W3 还是 W4。
   > 本项目已有"未编译改动堆积"三次教训，故保留"先验旧后验新"的纪律，而非取消它。
 - **C11 必须验**：`EARLY_INJECT_ENABLED=false` 是工作流 3 的唯一回滚开关。
 - **D 必须实测**：D5 阈值是当前唯一的"推理代替实核"遗留项。
@@ -132,6 +134,11 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
    而是入待挂队列（`MISS_CLASS_QUEUED`）等类加载后由三级机制之一挂上。
    若真机上仍只看到 `MISS class=...` 而无 `MISS_CLASS_QUEUED`，说明改动未生效（先查是否编译进包）。
 7. **`EARLY_INJECT_ENABLED` 是 `private const val`（编译期常量）**：**没有运行期开关**。§C11 的回滚验证**不是设置项操作**，而是改源码常量为 `false` → **重新编译** → 冷启动观测。同理，它只存在于模块（目标进程）侧，宿主 UI 无法控制。
+8. **本次修复的三处缺口（均为 W3/W4 后新增，未经编译）**：
+   a. 早期阶段未注册消息回调 → 早期脚本 send() 全部丢弃（见 §C13）；
+   b. TargetIpcServer 构造→setHookRouter 间的丢消息窗口（旧版无害因脚本晚加载；提前注入下真丢）→ 已改为**路由经构造器注入**（initialRouter 参数）；
+   c. 早期/构造后未消费消息未入 EarlyLogBuffer → 已补（见 §C14）。
+   三处的共同验收信号：**C13（早期 ARMED）+ C14（EARLY-PROBE 出现）**。
 
 ## I. 工作流 4（D3 类加载感知 / 三级再武装）—— `f069e7f`
 

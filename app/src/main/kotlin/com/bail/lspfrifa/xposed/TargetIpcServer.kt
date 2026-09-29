@@ -25,6 +25,8 @@ import com.bail.lspfrifa.ipc.IScriptExecutor
 class TargetIpcServer(
     private val targetPackage: String,
     private val appContext: Context? = null,
+    /** 初始路由：提前注入场景由构造方在构造时立即注入，回调注册那一刻即可用（无丢消息窗口）。 */
+    initialRouter: HookRouter? = null,
 ) : IScriptExecutor.Stub() {
 
     companion object {
@@ -44,7 +46,7 @@ class TargetIpcServer(
 
     /** 官方通道路由（P0）：JS 的 LSP.hook 请求先经它转接 libxposed hook()，未消费的消息才上行 UI。 */
     @Volatile
-    private var hookRouter: HookRouter? = null
+    private var hookRouter: HookRouter? = initialRouter
 
     fun setHookRouter(router: HookRouter?) {
         hookRouter = router
@@ -59,6 +61,10 @@ class TargetIpcServer(
                 // 1.5 官方通道路由：LSP.hook 请求被 HookRouter 消费（命中/失败日志经 hostLog 上行）
                 if (hookRouter?.tryHandle(message) == true) return
                 // 2. 跨进程推送宿主 Manager UI
+                //    D14：通道未建立时先入 ring buffer（握手后补发；flush 后 add 为空操作，无重复）。
+                //    为何需要：提前注入下脚本在 TargetIpcServer 构造前就已在跑，
+                //    而本回调注册（构造）到 registerLogReceiver（首次握手）之间存在窗口。
+                EarlyLogBuffer.add(message)
                 try {
                     logReceiver?.onLog(targetPackage, message)
                 } catch (e: RemoteException) {

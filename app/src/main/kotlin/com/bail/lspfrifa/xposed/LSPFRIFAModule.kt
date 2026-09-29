@@ -202,6 +202,33 @@ class LSPFRIFAModule : XposedModule() {
                 hostLog = { msg -> record(Log.INFO, msg) },
             )
             earlyRouter = router
+
+            // ★ 关键：必须先把消息回调挂上，再去加载脚本。
+            //
+            // 为何（这是一个真实缺陷的修复，不是防御性代码）：
+            //   GumJsBridge._messageCallback 默认为 null，全项目唯一赋值点是 TargetIpcServer.init。
+            //   而本函数（提前阶段）**不创建 TargetIpcServer**（它需要 Context，留到 App 阶段）。
+            //   若此处不注册，早期加载的脚本执行 LSP.hook() → send() → cpp on_message
+            //   → GumJsBridge.dispatchMessage → _messageCallback==null → **消息被静默丢弃**；
+            //   随后 App 阶段又因 earlyScriptLoaded 已置位而跳过 loadInitialScript
+            //   → hook 永远不会被注册，表现为“脚本加载成功但什么也没发生”。
+            //
+            // 回调内容与 TargetIpcServer.init 保持一致（先给 HookRouter，再上行宿主）；
+            // 宿主通道此刻不存在，故未消费的消息写入 EarlyLogBuffer，握手后由
+            // registerLogReceiver 一次性补发（这正是 D14 缓冲存在的意义）。
+            GumJsBridge.registerMessageCallback(object : GumJsBridge.OnScriptMessage {
+                override fun onScriptMessage(message: String) {
+                    Log.i("LSPFRIFA-Frida", "[" + targetPackage + "] " + message)
+                    try {
+                        if (earlyRouter?.tryHandle(message) == true) return
+                    } catch (t: Throwable) {
+                        record(Log.WARN, "event=early_dispatch_err err=" + t.message)
+                    }
+                    // 未消费（脚本 console.log / 自定义 send）：此时无 logReceiver，
+                    // 不补缓冲就会永久丢失（flush 后 add 为空操作，无重复风险）。
+                    EarlyLogBuffer.add(message)
+                }
+            })
             record(Log.INFO, "event=early_router_ready pkg=" + targetPackage)
 
             // D3①：路由就绪后立即 flush 一次（脚本重跑场景下，待挂项可能已可解析）
@@ -330,17 +357,20 @@ class LSPFRIFAModule : XposedModule() {
             System.loadLibrary("gumjs_bridge")
             GumJsBridge.init()
 
-            // 2. 构造 IPC 执行实体（内部已绑定 messageCallback）；
-            //    传入 app 上下文：宿主进程死亡后 TargetIpcServer 需要它重新注册
-            val ipcServer = TargetIpcServer(targetPackage, app)
-
-            // 2.5 官方通道路由（P0）：JS 脚本 LSP.hook(...) → 本路由 → libxposed hook()（LSPlant）。
+            // 2. 官方通道路由（P0）：JS 脚本 LSP.hook(...) → 本路由 → libxposed hook()（LSPlant）。
             //    目标类必须已被进程加载（framework 类总是可用；应用类需等其加载后再发请求）。
             //    D2：若提前阶段已建路由，则**接管**它而非新建 —— 提前挂的 hook 手柄在旧实例里，
             //    重建会丢失引用（泄漏）且无法卸载。
+            // 前向引用破环：路由的 hostLog 需要 ipcServer.hostLog，而 ipcServer 又需要路由
+            // ——用 ipcRef；其赋值前的日志回落 record（logcat + ring buffer），不丢。
+            var ipcRef: TargetIpcServer? = null
+            val upstream: (String) -> Unit = { msg ->
+                val s = ipcRef
+                if (s != null) s.hostLog(msg) else record(Log.INFO, msg)
+            }
             val existed = earlyRouter
             val hookRouter = if (existed != null) {
-                existed.attachRuntime(app) { msg -> ipcServer.hostLog(msg) }
+                existed.attachRuntime(app, upstream)
                 record(Log.INFO, "event=early_router_taken_over pkg=" + targetPackage)
                 existed
             } else {
@@ -349,10 +379,16 @@ class LSPFRIFAModule : XposedModule() {
                     targetLoader = app.classLoader,
                     appContext = app,
                     hooker = { m -> hook(m) },
-                    hostLog = { msg -> ipcServer.hostLog(msg) },
+                    hostLog = upstream,
                 )
             }
-            ipcServer.setHookRouter(hookRouter)
+
+            // 2.5 构造 IPC 实体，路由经构造器注入 —— 回调注册那一刻 router 即非 null，
+            //     不存在“构造完→setHookRouter”的丢消息窗口（该窗口在提前注入下是真实漏洞：
+            //     旧版脚本在 setHookRouter 之后才加载所以无害，现在脚本早已在跑）。
+            //     传入 app 上下文：宿主进程死亡后 TargetIpcServer 需要它重新注册。
+            val ipcServer = TargetIpcServer(targetPackage, app, hookRouter)
+            ipcRef = ipcServer
 
             // D3③：按开关决定是否安装类加载监听（激进模式，默认关）。
             // 失败不影响主链：监听只是“更快挂上”的优化，缺失时退化为 D3② 轮询。

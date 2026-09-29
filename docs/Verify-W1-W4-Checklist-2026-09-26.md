@@ -1,4 +1,4 @@
-# LSPFRIFA 真机验证清单（工作流 1/2/3 + D5 尺寸，2026-09-26）
+# LSPFRIFA 真机验证清单（工作流 1/2/3/4 + D5 尺寸，2026-09-26）
 
 > 前置：`git 458c8ac` 之后的一批改动（工作流 1 C-解耦Provider / 工作流 2 导入+模块化 / 工作流 3 A-时机提前）
 > **全部为静态验证态（`tools/check-kt.sh` 双绿），从未编译、从未真机**。
@@ -9,7 +9,13 @@
 
 ## 0. 编译（**已通过，本项仅需复核**）
 
-> **更正于 2026-09-26（审查发现）**：本清单初稿写"当前无 APK / 从未编译"，**与现场不符**。
+> **⚠️ 更新于 2026-09-26（W4 交付后）**：上面这份构建（07:32）**早于工作流 4**。
+> W4（`f069e7f`：D3 三级再武装 + 新文件 `HookModeStore.kt`）**从未编译过**，
+> 且它是全部改动里风险最高的一项（动了 `ClassLoader.loadClass` 拦截 + 新增待挂队列 + 新线程）。
+> **因此 §0 现在是真门槛，不再是“仅复核”**：W4 编译必须跑一次，且失败优先怀疑
+> `HookRouter.kt`（+245 行）与 `HookModeStore.kt`（新文件）。
+
+> **历史说明（保留）**：本清单初稿曾写"当前无 APK / 从未编译"，**与现场不符**。
 > 实测：`_build_run2.log`（07:21）`BUILD SUCCESSFUL in 2m 21s`，产出
 > `app/build/outputs/apk/debug/app-debug.apk`（90,385,982 B；dex 内含 `ScriptLibraryScreen`/`ImportTargetScreen`/`EarlyLogBuffer`）。
 > `find app/src -newer app-debug.apk` 为空 → **APK 与当前源码（=HEAD）一致，未过期**。
@@ -108,9 +114,10 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 
 ## G. 判定与后续门槛
 
-- **A/B/C/E 全绿 + D 回填完成** → 工作流 1/2/3 正式验收，才允许开始 **工作流 4（类加载感知/D3 三级再武装）**。
-  > 理由（技术）：工作流 4 的"再武装队列"挂在工作流 3 的早期注入/`attachRuntime` 生命周期上，
-  > 若 3 未真机验证就叠 4，一旦出问题无法区分是 3 还是 4（本项目已有"未编译改动堆积"三次教训）。
+- **A/B/C/E 全绿 + D 回填完成** → 工作流 1/2/3 正式验收。
+- **W4（D3）验收另见 §I**，其风险独立：即使 A/B/C 未全绿也可先跑 I1–I3（队列基础行为），
+  但 **I5（与提前注入叠加）必须在 C 组通过后再跑** —— 否则一旦异常无法区分是 W3 还是 W4。
+  > 本项目已有"未编译改动堆积"三次教训，故保留"先验旧后验新"的纪律，而非取消它。
 - **C11 必须验**：`EARLY_INJECT_ENABLED=false` 是工作流 3 的唯一回滚开关。
 - **D 必须实测**：D5 阈值是当前唯一的"推理代替实核"遗留项。
 
@@ -121,5 +128,69 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 3. 远程文件通道**只读**（宿主无法向目标推送文件）→ 脚本分发必须走 remote prefs。
 4. remote prefs **无事务语义**：`Editor.apply()` 失败仅打日志 → 写入靠**读回验证**。
 5. **模块化拼装未接线（但库页可用）**：`modules.<pkg>` 键已建、`ScriptStore.setModules`/`enabledModules` 已定义**但全项目零调用**（用户已明确暂缓）→ **D9 模块粒度、D10 冲突语义当前均不生效**。**注意**：这不影响库页功能——库页「应用」是把脚本**正文**写入目标脚本（脚本级生效），与"按模块粒度开关"是两件事，勿混为一谈。
-6. 工作流 4 未实施 → 脚本 hook **未加载的应用类**仍然 `MISS`（这是工作流 4 要解决的）。
+6. **工作流 4 已实施（`f069e7f`）但从未编译/真机验证**：脚本 hook **未加载的应用类**不再直接 `MISS`，
+   而是入待挂队列（`MISS_CLASS_QUEUED`）等类加载后由三级机制之一挂上。
+   若真机上仍只看到 `MISS class=...` 而无 `MISS_CLASS_QUEUED`，说明改动未生效（先查是否编译进包）。
 7. **`EARLY_INJECT_ENABLED` 是 `private const val`（编译期常量）**：**没有运行期开关**。§C11 的回滚验证**不是设置项操作**，而是改源码常量为 `false` → **重新编译** → 冷启动观测。同理，它只存在于模块（目标进程）侧，宿主 UI 无法控制。
+
+## I. 工作流 4（D3 类加载感知 / 三级再武装）—— `f069e7f`
+
+> **前置**：§0 必须先过。W4 动了 `ClassLoader.loadClass` 拦截 + 新增待挂队列 + 新线程，
+> 是全部改动里风险最高的一项，且**从未编译过**。
+>
+> **背景（为何要测）**：原行为下脚本 hook 未加载的类只能 `MISS` 并放弃。
+> W4 后改为入待挂队列，由三级机制之一在类可解析时自动挂上：
+> ①锚点flush（主线程、上限 8 项）②轮询（200ms，上限≈2min）③loadClass监听（默认关）。
+
+### I-a 基础（开关关，走默认轮询路径）
+
+| # | 操作 | 预期日志 |
+|---|---|---|
+| I1 | 写脚本 hook 一个**尚未加载**的应用类（如 `com.example.target.MainActivity`），冷启动目标后立即看日志 | `[lsp-hook] MISS_CLASS_QUEUED <cls>#<method> (queued) pending=1` —— **关键：不再是裸 `MISS class=`** |
+| I2 | 继续用该应用，直到该类被加载 | `[lsp-hook] ARMED_LATE <cls>#<method> src=poll`（默认路径，≤200ms 内）+ 随后出现 `ARMED` |
+| I3 | 观察目标 App 是否变慢/卡顿 | 无可见影响（轮询仅在队列非空时跑，队列空时线程已退） |
+| I4 | **防崩溃验证**：整个 I1–I3 期间搜日志 | **不得出现 `POLL_ERR`**；目标 App **不得被杀**。
+> 为何特别关注：安卓任意线程未捕获异常会杀**整个目标进程**，而轮询线程跑在目标内。 |
+| I5 | 观察超时行为（类始终不加载，如写一个不存在的类名） | ~2 分钟后 `[lsp-hook] POLL_GIVEUP pending=N ticks=…`（防线程永久驻留） |
+| I6 | 脚本热重载（编辑器点“运行”） | `[lsp-hook] PENDING_CLEARED n=N`（旧待挂请求随重载清掉，防迟到生效） |
+| I7 | 回归：现有 observe / replace / overload 模板 | 行为零变化，`ARMED` 照旧 |
+
+### I-b 锚点 flush（第①级）
+
+| # | 操作 | 预期 |
+|---|---|---|
+| I8 | 在**提前阶段**（W3）就产生 MISS：脚本 hook 一个在 `onPackageReady` 时仍未加载的类 | `MISS_CLASS_QUEUED` 出现于早期阶段；随后 `ARMED_LATE … src=anchor`（截获于 `callApplicationOnCreate` proceed 之前） |
+| I9 | 若一次产生 >8 个待挂项 | 前 8 个走 `src=anchor`，剩余的下一轮 `src=poll`（`FLUSH_MAX_ITEMS=8` 是主线程预算，剩余交给轮询） |
+
+### I-c loadClass 监听（第③级，激进模式，默认关）
+
+| # | 操作 | 预期 |
+|---|---|---|
+| I10 | 设置页开「类加载感知」→ **重启目标**（开关下次注入生效） | 目标侧 `event=loadclass_watch_requested pkg=<pkg>` + `[lsp-hook] CLASSLOADER_WATCH_ON` |
+| I11 | 同 I1 场景（hook 未加载类） | `ARMED_LATE … src=loadclass`（比轮询快，无需等 200ms） |
+| I12 | 目标内大批量加载类（如启动时） | **无卡顿**（稳态开销 = 一次 `pendingHooks.isEmpty()`）；无 `CLASSLOADER_WATCH_FAIL` |
+| I13 | 设置页关「类加载感知」→ 重启目标 | 无 `CLASSLOADER_WATCH_ON`；I1 场景退化为 `src=poll`（轮询兼容，功能不丢） |
+| I14 | **重要限制确认**：开着监听时点“运行”热更脚本 | 监听**不会被卸**（它单独持有、不进 `handles`）——故无需重装；
+> 反例：若监听与脚本 hook 同生命周期，热更会把它一起卸掉，导致后续新 MISS 无人接手。 |
+
+### I-d 与工作流 3 叠加（**必须 C 组通过后再跑**）
+
+| # | 操作 | 预期 |
+|---|---|---|
+| I15 | 冷启动已启用目标，脚本含“未加载类 hook” | 日志顺序：`early_router_ready` → `MISS_CLASS_QUEUED` → `application_created` → `ARMED_LATE src=anchor` → `early_router_taken_over` |
+| I16 | 同 I15，确认路由接管后 hook 存活 | `early_router_taken_over` 后，`ARMED`/`ARMED_LATE` 的手柄仍生效（业务 hook 能触发）——
+> 这是 `attachRuntime` 的真实价值：**仅换了运行期依赖，未重建实例；若这里出错就是手柄丢了** |
+
+### I-e 开关回滚
+
+| # | 操作 | 预期 |
+|---|---|---|
+| I17 | 设置页开监听后**不重启**目标，直接看日志 | 无 `CLASSLOADER_WATCH_ON`（**开关是“下次注入生效”**，非即时；依据：D13 不改 AIDL） |
+| I18 | 监听导致问题时：设置页关掉 + 重启目标 | 退回轮询路径；若仍异常，则是 W4 基础部分（I1–I7）的问题，与监听无关 |
+
+### I-f W4 的已知未完成（勿当 bug）
+
+1. `uninstallClassLoaderWatcher()` **无调用方**（预留给“关开关立即卸载”，但不改 AIDL 就无法触达运行中进程）。
+2. 监听安装失败仅降级（`CLASSLOADER_WATCH_FAIL`），不阻断注入——监听本属优化。
+3. 待挂队列的**去重维度是 `cls#method#tag`（不含签名）**：同 tag 同方法的不同 overload 视为一项，
+   真正区分在挂载时由 `sigs` 完成。若发现“只挂了一个 overload”，先查是否脚本未调 `overload()`。

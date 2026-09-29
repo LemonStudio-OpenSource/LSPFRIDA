@@ -91,7 +91,7 @@ Java.perform(function () {
 
 ## 📚 文档
 
-- [交接与验证状态](docs/Handoff-2026-08-25.md)（架构/坑位库/验证矩阵）
+- [交接与验证状态](docs/Handoff-2026-09-26.md)（架构/坑位库/验证矩阵）
 - [路线B 事实簿](docs/RouteB-Facts.md) / [实现方案](docs/RouteB-Plan.md) / [真机验证清单](docs/RouteB-Verify-List.md)
 - [UI 参考对齐](docs/UI-Reference-Comparison.md) / 日志持久化 / IPC 在线状态 / 官方通道设计等见 `docs/`
 

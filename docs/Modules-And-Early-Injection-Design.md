@@ -402,6 +402,50 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 
 **模块化拼装仍暂缓**（用户明确）；`setModules`/`enabledModules` 仍未调用。
 
+### 第六轮修复（提前注入消息链三处缺口 — 2026-09-26）
+
+> 本轮不对应新工作流，而是 W3 引入的**回归缺陷**修复。三处缺口症状相同：
+> **「脚本已加载，但 hook 永远不生效，宿主 UI 也看不到相关日志」**。
+
+#### 缺陷 1（致命）：早期阶段从未注册消息回调
+- **现状事实**：`GumJsBridge._messageCallback` 默认 `null`，全项目唯一赋值点是
+  `TargetIpcServer.init`；而 `runEarlyInject` **不创建** `TargetIpcServer`（它需要 Context）。
+- **后果链**：早期脚本 `send()` → cpp `on_message` → `dispatchMessage` → 回调 null → **静默丢弃**；
+  App 阶段又因 `earlyScriptLoaded` 已置位而跳过 `loadInitialScript` → **hook 永不注册**。
+- **修复**：`runEarlyInject` 在 `loadScriptEarly` **之前**先 `registerMessageCallback`，
+  路由到 `earlyRouter.tryHandle`；未消费的入 EarlyLogBuffer。
+- **为何之前静态检查未发现**：这不是语法/符号问题，而是**初始化顺序的语义依赖**，
+  规则式检查无法覆盖。教训：新增生命周期阶段时，必须逐项核对“旧阶段中建立的关键依赖在哪建立”。
+
+#### 缺陷 2：`TargetIpcServer` 构造 → `setHookRouter` 之间的丢消息窗口
+- 该窗口内 `hookRouter == null`，消息不被路由。
+- **为何旧版无害**：旧版脚本在 `setHookRouter` **之后**才加载（init 链尾部），窗口内根本没有消息。
+- **为何现在真丢**：提前注入下脚本**早已在跑**，窗口内会真实到达 `lsp.hook` 消息。
+- **修复**：路由改为**经构造器注入**（新增 `initialRouter` 参数，字段初始值即路由）→ 窗口消失。
+  随之在 `runInitChain` 中把路由构造提前，并用 `ipcRef` 破 `hostLog` ↔ `ipcServer` 的前向引用环
+  （环未破前的日志回落 `record()`，进 logcat + ring buffer，不丢）。
+
+#### 缺陷 3：早期/构造后未消费消息未入缓冲
+- 非 hook 消息（脚本 `console.log` / 自定义 `send`）在通道建立前只进 logcat，
+  不进 `EarlyLogBuffer` → 宿主 UI 永久看不到（D14 缓冲的意义正在于此）。
+- **修复**：两处回调的未消费分支均 `EarlyLogBuffer.add(message)`
+  （flush 后 `add` 为空操作，无重复风险）。
+
+#### 改动文件
+| 文件 | 改动 |
+|---|---|
+| `LSPFRIFAModule.kt` | `runEarlyInject` 注册回调；`runInitChain` 路由先行 + `ipcRef` 破环 + 构造器注入 |
+| `TargetIpcServer.kt` | 新增 `initialRouter` 参数；两处回调补 `EarlyLogBuffer.add` |
+
+#### 验收口径（写入清单 §C13/§C14/§H8）
+- **§C13**：早期 `ARMED` 出现在 `event=application_created` 之前（而非“已加载但无 ARMED”）。
+- **§C14**：早期 `EARLY-PROBE` 日志最终在宿主面板出现。
+
+#### ⚠️ 诚实声明
+- 本轮为**静态修复**：`tools/check-kt.sh` 双绿，**未经编译**（含新签名，编译时优先怀疑
+  `TargetIpcServer` 构造调用点）；真机未验证。
+- `setHookRouter()` 现已无调用方（保留为公共 API，但主链已不再依赖它）。
+
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 
 - **工作流 1**：宿主冷启动前先启动目标 → 脚本应仍注入成功（`load_persisted_script src=remote_prefs`）；

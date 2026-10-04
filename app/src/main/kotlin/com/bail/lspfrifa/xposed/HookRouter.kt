@@ -265,6 +265,16 @@ class HookRouter(
          * 若真机观察到启动卡顿，继续下调此值即可（无需改结构）。
          */
         const val FLUSH_MAX_ITEMS = 8
+
+        /**
+         * encodeValue 用：|v| > 2^53 的 Long 经 JSON double 往返会丢精度，仅告警不拦截。
+         *
+         * 为何合并在本 companion：Kotlin 每类只允许**一个** companion object。
+         * 本文件原先在末尾另有一个 companion（只含此常量），W4 插入轮询常量时
+         * 又新建了一个 → 双 companion 编译失败（Conflicting declarations / Only one
+         * companion object is allowed）。本处为合并修复。
+         */
+        const val MAX_SAFE_LONG = 9007199254740992L   // 2^53
     }
 
     private data class HookRequest(
@@ -777,7 +787,4 @@ class HookRouter(
         }
     }
 
-    private companion object {
-        const val MAX_SAFE_LONG = 9007199254740992L   // 2^53
-    }
 }

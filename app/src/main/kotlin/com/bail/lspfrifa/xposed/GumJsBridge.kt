@@ -355,12 +355,22 @@ object GumJsBridge {
             if (typeof cls !== "string" || cls.length === 0) { throw __lspErr("Java.use 需要类名字符串"); }
             return __lspClassWrapper(cls);
           };
+          // Java.available：标准 frida 能力探针（脚本常以 `if (!Java.available) return;` 早退）。
+          // 修复动机（真机实测）：此前 available 为 undefined —— Object.assign 不复制原型上的
+          // getter（bundle 的 available 定义在 Runtime 原型上）→ 探针恒为 falsy →
+          // **所有**依赖该探针的 Java 路径被整体跳过（实测日志 “Java unavailable, cannot
+          // schedule GL ...”，即使脚本只用 use/perform —— 本 shim 完全支持的子集）。
+          // 本模块是 LSPosed 模块，目标进程必有 JVM，且 hook 注册链（use/perform/implementation）
+          // 可用 → 常量 true。注意：这**不**让 bundle 深度 API（choose/registerClass 等）变为可用：
+          // 它们被下方 stub 替换为可读错误（choose / registerClass 等），
+          // 脚本调用时会得到可读失败而非被 available 探针静默跳过。
+          ourJava.available = true;
 
           // 归属合并（cap 裁定）：use/perform 覆盖同名；bundle 其它 API 保留兼容；无 bundle 时直接 ourJava
           var bundleJava = (typeof globalThis.Java === "object" && globalThis.Java !== null) ? globalThis.Java : null;
           var merged = Object.assign(Object.create(null), bundleJava, ourJava);
           // B1 明确不实现的 bundle 专有 API：bundle 缺失时给可读错误（避免静默 undefined）
-          ["choose", "register", "openClassFile", "array", "type"].forEach(function (name) {
+          ["choose", "register", "registerClass", "openClassFile", "array", "type"].forEach(function (name) {
             if (!(name in merged)) {
               Object.defineProperty(merged, name, {
                 configurable: true, enumerable: true,

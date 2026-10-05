@@ -365,6 +365,53 @@ static void on_message(const gchar *message, GBytes *data, gpointer user_data) {
     if (attached) g_vm->DetachCurrentThread();
 }
 
+// ============================================================================
+// 常驻消息泵（根因修复，2026-10-05）：脚本输出积压 → 需热更新才涌出
+//
+// 症状（真机实测）：脚本 main() 日志后长时间静默；手动点“运行”（热更新）后，
+//   积压日志一次性涌出——其中 `engine poll left 4760` 与 `left 4720` 的时间戳
+//   仅相隔 1ms，而按脚本配置（50ms×40tick）二者必须相隔 2s（排队后冲出的铁证）。
+//
+// 根因（源码实证）：
+//   - 脚本出站消息（send/console.log）经 gum_quick_script_emit 以 idle source 挂到
+//     【脚本创建线程的 thread-default context】；Java 线程无 thread-default →
+//     回退到【进程默认 GMainContext】（frida-gum gumquickscript.c + glib gmain.c
+//     g_main_context_ref_thread_default 回退逻辑）。
+//   - 目标进程没有任何线程持续泵送该 context：仅有的派发点是
+//     ① nativeLoadScript 尾部的一次性排空（故加载瞬间的 main() 日志能出）；
+//     ② nativeCallJs 等待 reply 时的泵（仅 hook 命中时发生）。
+//   - 而脚本定时器/逻辑照常运行（定时器挂 gum-js-loop 的 js_context，由调度器主循环
+//     泵送，与本问题无关）→ 功能其实执行了，但输出全部积压。
+//
+// 修复：启动一条常驻线程（lspfrifa-pump）对默认 context 运行主循环——等价于
+//   frida-server “主线程跑主循环”的职责。进程内幂等，仅启动一次，随进程结束终止。
+// ============================================================================
+static std::atomic<bool> g_pump_started{false};
+
+static gpointer lspfrifa_pump_thread_func(gpointer data) {
+    (void) data;
+    // nullptr → 全局默认 context（与 emit 挂载点一致；该 context 进程生命周期内
+    // 永不销毁，无需 ref/unref）。主循环常驻，消息到达即派发。
+    GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
+    if (loop == nullptr) {
+        LOGE("[pump] g_main_loop_new failed");
+        return nullptr;
+    }
+    LOGI("[pump] message pump started (default context)");
+    g_main_loop_run(loop);   // 永不退出；随进程结束终止
+    return nullptr;
+}
+
+/** 幂等启动消息泵线程（首次调用后为 no-op）。 */
+static void lspfrifa_ensure_pump(void) {
+    if (g_pump_started.exchange(true)) return;
+    GThread *th = g_thread_try_new("lspfrifa-pump", lspfrifa_pump_thread_func, nullptr, nullptr);
+    if (th == nullptr) {
+        g_pump_started.store(false);
+        LOGE("[pump] failed to create pump thread");
+    }
+}
+
 extern "C"
 JNIEXPORT jboolean JNICALL
 Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeInitEngine(JNIEnv *env, jclass) {
@@ -385,6 +432,8 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeInitEngine(JNIEnv *env, jclass) 
         }
         // 注：GumJS 17.x 自带默认调度器，无需手动创建
     }
+    // 常驻消息泵（幂等；根因修复：脚本输出积压 —— 详见本函数上方注释块）
+    lspfrifa_ensure_pump();
     return JNI_TRUE;
 }
 
@@ -446,6 +495,15 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeLoadScript(
     GMainContext *ctx = g_main_context_default();
     while (g_main_context_pending(ctx)) {
         g_main_context_iteration(ctx, FALSE);
+    }
+    // F4 宽限（与常驻泵并发的防漏判）：错误消息可能已被泵线程领取但尚未派发完成
+    // （pending 短暂为 false 而 flag 未置位）——最多宽限 ~10ms 并持续排空，避免漏判
+    // “加载即报错”。代价：正常加载最多多 ~10ms（一次性，可忽略）。
+    for (int i = 0; i < 10 && !g_load_error_pending.load(); i++) {
+        g_usleep(1000);
+        while (g_main_context_pending(ctx)) {
+            g_main_context_iteration(ctx, FALSE);
+        }
     }
 
     if (g_load_error_pending.load()) {

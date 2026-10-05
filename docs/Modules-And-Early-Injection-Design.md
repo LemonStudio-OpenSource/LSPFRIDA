@@ -441,6 +441,53 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 - **§C13**：早期 `ARMED` 出现在 `event=application_created` 之前（而非“已加载但无 ARMED”）。
 - **§C14**：早期 `EARLY-PROBE` 日志最终在宿主面板出现。
 
+### 第七轮修复（脚本输出积压 + Java.available 失效 — 2026-10-05）
+
+> 由真机日志定位。症状：脚本启动后长时间静默，手动热更新后积压日志一次性涌出。
+> 铁证：`engine poll left 4760` 与 `left 4720` 时间戳仅隔 **1ms**，
+> 而按脚本配置（50ms×40tick）二者必须相隔 **2s** —— 积压后冲出的特征。
+
+#### 缺陷 1（主修）：目标进程内无任何线程持续泵送默认 GMainContext
+- **事实链**：脚本出站消息经 `gum_quick_script_emit` 以 idle source 挂到
+  【脚本创建线程的 thread-default context】；Java 线程无 thread-default → 回退到
+  **进程默认 GMainContext**（frida-gum `gumquickscript.c:1127` + glib `gmain.c:943`）。
+  而目标进程内**没有任何线程持续泵送该 context**——仅有的派发点是
+  ① `nativeLoadScript` 尾部一次性排空 ② `nativeCallJs` 等 reply 时的泵（仅 hook 命中）。
+- **关键澄清**：脚本定时器/逻辑**照常运行**（定时器挂 `js_context`，由 gum-js-loop
+  调度器泵送）——所以“功能其实执行了，但输出全部积压”。这解释了
+  “为什么点一下才完全执行”的错觉。
+- **修复**：新增常驻线程 `lspfrifa-pump` 对默认 context 跑 `g_main_loop_run`
+  （等价于 frida-server 主线程跑主循环的职责）。进程内幂等。
+- **并发配套**：`nativeLoadScript` 的 F4 错误检测加 ~10ms 宽限
+  （防泵线程领走 error 消息但尚未派发时被误判“加载成功”）。
+
+#### 缺陷 2：`Java.available` 探针恒为 falsy
+- **事实链**：合并用 `Object.assign(Object.create(null), bundleJava, ourJava)`；
+  `Object.assign` **只复制可枚举自有属性**，而 bundle 的 `available` 是定义在
+  `Runtime` **原型**上的 getter → 不被复制 → `merged.available === undefined`。
+- **后果**：脚本里 `if (!Java.available) return;` 类早退探针（行业惯用写法）恒成立
+  → 整条 Java 路径被**静默跳过**（实测日志 “Java unavailable, cannot schedule GL ...”，
+  即使脚本只依赖 use/perform —— 本 shim 完全支持的子集）。
+- **修复**：shim 显式 `ourJava.available = true`；同时把 `registerClass` 补入
+  “显式可读错误” stub 列表（避免 available=true 后它从 undefined 变静默失败）。
+- **边界**：available=true **不代表** bundle 深度 API（choose/registerClass/openClassFile）
+  可用——它们仍为可读错误。
+
+#### 改动文件
+| 文件 | 改动 |
+|---|---|
+| `app/src/main/cpp/gumjs_bridge.cpp` | +泵线程块（~50 行）、initEngine 启动、F4 宽限 |
+| `GumJsBridge.kt` | `ourJava.available = true` + stub 列表加 `registerClass` |
+
+#### 验证
+- **clang++ -fsyntax-only**（NDK 28 sysroot + devkit，aarch64-linux-android26）：
+  当前版 0 错；HEAD 对照 0 错；**故意破坏版正确报错**（检查有效性已验证）
+- JS shim：`node --check` 通过；`tools/check-kt.sh` 双绿
+
+#### ⚠️ 诚实声明
+- 静态验证已尽力（含 clang 真语法检查 + 反向验证），**未经真机复测**。
+- 预期：启动后日志实时流动，不再需要点“运行”；`Java unavailable` 日志消失。
+
 #### ⚠️ 诚实声明
 - 本轮为**静态修复**：`tools/check-kt.sh` 双绿，**未经编译**（含新签名，编译时优先怀疑
   `TargetIpcServer` 构造调用点）；真机未验证。

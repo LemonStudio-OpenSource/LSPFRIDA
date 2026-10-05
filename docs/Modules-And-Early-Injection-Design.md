@@ -534,6 +534,50 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 | `HookRouter.kt` | 轮询注释更正（timer 误诊 → 设计选择） |
 | `Handoff / Design / Checklist` | 三处 timer 误诊记载全部更正 |
 
+### 第九轮：引擎全面审查（2026-10-05）
+
+> 按层审查：native（cpp）→ JNI 边界 → Kotlin 桥接 → 与 HookRouter 交互。
+> 共发现并修复 **3 类 14 处**缺陷；同时确认了若干“看似可疑但实际安全”的设计。
+> 前置背景：常驻消息泵（`e659ce9`）把消息派发从“偶发”变为“持续”，
+> 使既有竞态从低概率放大为常态——本批与其配套修复。
+
+#### A. 并发竞态（UAF 级）
+| # | 缺陷 | 修复 |
+|---|---|---|
+| 1 | `g_script` 无锁解引用（callJs/postOriginalReply）vs 并发 unload+unref → **use-after-free** | 新增 `g_script_lock` + `lsp_acquire_script()`（锁内取强引用，用毕 unref）；加载/卸载改“锁内摘除→锁外卸载”；新脚本**最后一步**发布 |
+| 2 | `g_callback` 交换竞态（SetCallback 的 Delete/NewGlobalRef 之间被泵线程读取）→ UAF | 新增 `g_callback_lock` + 锁内 `NewLocalRef` 取局部引用；附带缓存 jmethodID |
+
+#### B. UTF-8 边界（静默损坏）
+| # | 缺陷 | 修复 |
+|---|---|---|
+| 3 | 输出侧：`NewStringUTF` 对非 modified-UTF8（emoji）UB | `lsp_new_jstring()`：UTF-8→UTF-16→NewString；非法输入 `g_utf8_make_valid` 清洗 |
+| 4 | 输入侧：`GetStringUTFChars` 产出 modified UTF-8（CESU-8）→ 非法字节进 JSON/引擎 | `lsp_get_utf8()`：`GetStringChars`→`g_utf16_to_utf8`；覆盖脚本正文/name、id/payload、retJson |
+
+#### C. 调度与健壮性
+| # | 缺陷 | 修复 |
+|---|---|---|
+| 5 | `flushPending` 预算按“成功数”计 → CNFE 不增 done → 锚点路径（主线程）扫全队列 | 加 `scanned` 双重约束 |
+| 6 | loadclass 分支 flush 用 `Int.MAX_VALUE` 且跑主线程 | 改为 `FLUSH_MAX_ITEMS`（剩余由轮询接手） |
+| 7 | `on_message`：F4 错误捕获被 `g_callback==nullptr` 提前 return 跳过 | 错误捕获与 rpc 消费**前移**到一切检查之前 |
+| 8 | Kotlin 回调抛异常未清理 → 悬挂 JNI 异常 | `ExceptionCheck/Describe/Clear` |
+| 9 | `message==nullptr` 未防（`NewStringUTF(NULL)` UB） | 已加防御 |
+
+#### 已确认安全（看似可疑，实非缺陷）
+- **pump 线程 vs callJs 自泵**：GLib context 同一时刻只能一个 owner；pump 持有时
+  其他线程的非阻塞 iterate 返回 FALSE（gmain.c 实证）→ 不会双重 dispatch；
+  callJs 的等待由 pump 线程的 cond signal 唤醒（比自泵更可靠）。
+- **post 到已卸载脚本**：frida 的 `do_post` 检查 `incoming_message_sink`，为 NULL 时
+  丢弃消息并释放（gumquickcore.c 实证）→ 强引用模式不会 UAF。
+- **pending 条目生命周期**：超时后 owner 线程唯一移除+释放；迟到 reply 未命中静默消费。
+
+#### 改动文件
+- `app/src/main/cpp/gumjs_bridge.cpp`（+~200/-60）
+- `HookRouter.kt`（2 处预算修复）
+
+#### 验证
+- clang++ -fsyntax-only（NDK 28 sysroot）：0 错；反向验证（故意破坏）正确报错
+- check-kt.sh 双绿；花括号净值全平衡
+
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 
 - **工作流 1**：宿主冷启动前先启动目标 → 脚本应仍注入成功（`load_persisted_script src=remote_prefs`）；

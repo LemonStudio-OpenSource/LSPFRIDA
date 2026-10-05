@@ -60,6 +60,23 @@ static GMutex g_pending_lock;
 static GHashTable *g_pending = nullptr;    // id(str) -> LspPending*
 static std::atomic<gint64> g_orig_seq{0};
 
+// ============================================================================
+// 引擎审查修复（2026-10-05）：g_script / g_callback 并发竞态
+//
+// 背景：常驻消息泵（e659ce9）把消息派发从“偶发”变为“持续”，使两条既有竞态
+//   从低概率放大为常态，必须同批修复：
+//   ① g_script：nativeCallJs / nativePostOriginalReply 无锁解引用，而
+//      nativeLoadScript / nativeUnloadScript 会并发卸载并 g_object_unref
+//      → use-after-free（目标进程崩溃）。
+//   ② g_callback：on_message（泵线程持续执行）在 nativeSetCallback 的
+//      DeleteGlobalRef 与 NewGlobalRef 之间读取 → 引用已释放的 jobject → UAF。
+// 修复原则：锁只保护“指针交换”与“引用获取”两个瞬时动作；耗时操作一律锁外。
+// ============================================================================
+static GMutex g_script_lock;     // 保护 g_script（发布/摘除交换 vs 取引用）
+static GMutex g_callback_lock;   // 保护 g_callback / g_callback_mid（交换 vs 取用）
+static jmethodID g_callback_mid = nullptr;   // onScriptMessage 方法 id（注册时缓存）
+static std::atomic<bool> g_locks_ready{false};   // nativeInitEngine 完成标记（锁就绪守卫）
+
 static LspPending *pending_new(void) {
     LspPending *p = g_slice_new0(LspPending);
     g_cond_init(&p->cond);
@@ -325,18 +342,73 @@ static void pending_clear_all(void) {
 
 // ============================================================================
 
+/** 锁内取 g_script 强引用（无脚本返回 nullptr）。调用方用毕须 g_object_unref。 */
+static GumScript *lsp_acquire_script(void) {
+    g_mutex_lock(&g_script_lock);
+    GumScript *s = g_script;
+    if (s != nullptr) g_object_ref(s);
+    g_mutex_unlock(&g_script_lock);
+    return s;
+}
+
+/** UTF-8 -> jstring 安全转换（先转 UTF-16 再 NewString）。
+ *  规避 NewStringUTF 对非 modified-UTF8（emoji 四字节序列/非法字节）的未定义行为；
+ *  非法输入先经 g_utf8_make_valid 清洗，保证不丢消息、不崩溃。 */
+static jstring lsp_new_jstring(JNIEnv *env, const char *utf8) {
+    if (utf8 == nullptr) return nullptr;
+    glong written = 0;
+    gunichar2 *u16 = g_utf8_to_utf16(utf8, -1, nullptr, &written, nullptr);
+    if (u16 == nullptr) {
+        gchar *fixed = g_utf8_make_valid(utf8, -1);
+        if (fixed == nullptr) return nullptr;
+        u16 = g_utf8_to_utf16(fixed, -1, nullptr, &written, nullptr);
+        g_free(fixed);
+        if (u16 == nullptr) return nullptr;
+    }
+    jstring s = env->NewString(reinterpret_cast<const jchar *>(u16), (jsize) written);
+    g_free(u16);
+    return s;
+}
+
+/** Java String -> 标准 UTF-8（g_malloc；调用方 g_free）。
+ *  输入侧 UTF 修复（引擎审查，2026-10-05）：JNI GetStringUTFChars 产出 modified UTF-8——
+ *  非 BMP 字符（emoji 等）按 CESU-8 编码（每代理 3 字节）→ 对 JSON 解析器与
+ *  gum_script_backend（均要求标准 UTF-8）属非法字节序列。
+ *  本函数改走 GetStringChars（UTF-16 原文）→ g_utf16_to_utf8（标准编码）。
+ *  非法 UTF-16（未配对代理）退化为 modified UTF-8（保数据不丢）。 */
+static gchar *lsp_get_utf8(JNIEnv *env, jstring js, const char *fallback) {
+    if (js == nullptr) return (fallback != nullptr) ? g_strdup(fallback) : nullptr;
+    const jchar *chars = env->GetStringChars(js, nullptr);
+    gchar *out = nullptr;
+    if (chars != nullptr) {
+        jsize len = env->GetStringLength(js);
+        out = g_utf16_to_utf8(reinterpret_cast<const gunichar2 *>(chars), (glong) len,
+                              nullptr, nullptr, nullptr);
+        env->ReleaseStringChars(js, chars);
+    }
+    if (out == nullptr) {
+        const char *m = env->GetStringUTFChars(js, nullptr);
+        out = (m != nullptr) ? g_strdup(m) : ((fallback != nullptr) ? g_strdup(fallback) : nullptr);
+        if (m != nullptr) env->ReleaseStringUTFChars(js, m);
+    }
+    return out;
+}
+
 // GumJS on_message -> JNI 回调宿主层 (console.log / send() / frida:rpc reply)
 static void on_message(const gchar *message, GBytes *data, gpointer user_data) {
     (void) data; (void) user_data;
-    if (g_vm == nullptr || g_callback == nullptr) return;
 
-    // F4：捕获加载期引擎异常消息（原逻辑保持不变）
+    // ① F4：加载期错误捕获——先于一切检查（callback 未注册时同样必须捕获；
+    //    修复前该路径被 g_callback==nullptr 提前 return 跳过 → “加载即报错”被漏判为成功）。
     if (message != nullptr &&
         strncmp(message, ERROR_MESSAGE_PREFIX, sizeof(ERROR_MESSAGE_PREFIX) - 1) == 0) {
         g_load_error_pending.store(true);
     }
 
-    // RouteB：frida:rpc reply 与 lsp.rpc_inner 在 native 层原生消费（不进 Kotlin / 不上行宿主 UI）
+    if (g_vm == nullptr) return;
+
+    // ② native 层消费（rpc reply / rpc_inner）——不依赖 callback，必须先于 callback 检查：
+    //    修复前 callback 未注册时 reply 被丢弃 → 调用方 500ms 超时（丢回复）。
     if (message != nullptr) {
         // t10-C②：入站消息头诊断（仅 frida:rpc 数组消息——send/console.log 走 Kotlin UI 日志不重复打）
         if (strstr(message, "frida:rpc") != nullptr) {
@@ -345,7 +417,9 @@ static void on_message(const gchar *message, GBytes *data, gpointer user_data) {
         if (handle_rpc_reply(message)) return;
         if (handle_rpc_inner(message)) return;
     }
+    if (message == nullptr) return;   // 防御：无内容可上行（原代码未查空，NewStringUTF(NULL) 属未定义）
 
+    // ③ 上行 Kotlin（需 callback；锁内取局部引用，防与 nativeSetCallback 交换竞争 → UAF）
     JNIEnv *env = nullptr;
     bool attached = false;
     if (g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
@@ -353,14 +427,28 @@ static void on_message(const gchar *message, GBytes *data, gpointer user_data) {
         attached = true;
     }
 
-    jclass cls = env->GetObjectClass(g_callback);
-    jmethodID mid = env->GetMethodID(cls, "onScriptMessage", MESSAGE_SIG);
-    if (mid != nullptr) {
-        jstring jmsg = env->NewStringUTF(message);
-        env->CallVoidMethod(g_callback, mid, jmsg);
-        env->DeleteLocalRef(jmsg);
+    jobject cb = nullptr;
+    jmethodID mid = nullptr;
+    g_mutex_lock(&g_callback_lock);
+    if (g_callback != nullptr) {
+        cb = env->NewLocalRef(g_callback);   // 局部引用保活：此后全局引用即使被换掉，本引用仍有效
+        mid = g_callback_mid;
     }
-    env->DeleteLocalRef(cls);
+    g_mutex_unlock(&g_callback_lock);
+
+    if (cb != nullptr && mid != nullptr) {
+        jstring jmsg = lsp_new_jstring(env, message);
+        if (jmsg != nullptr) {
+            env->CallVoidMethod(cb, mid, jmsg);
+            env->DeleteLocalRef(jmsg);
+            // Kotlin 回调若抛异常：在 JNI 层清理，避免悬挂异常影响后续 JNI 调用/线程分离
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+    }
+    if (cb != nullptr) env->DeleteLocalRef(cb);
 
     if (attached) g_vm->DetachCurrentThread();
 }
@@ -417,6 +505,9 @@ JNIEXPORT jboolean JNICALL
 Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeInitEngine(JNIEnv *env, jclass) {
     env->GetJavaVM(&g_vm);
     g_mutex_init(&g_pending_lock);
+    g_mutex_init(&g_script_lock);     // 引擎审查修复：g_script 生命周期锁
+    g_mutex_init(&g_callback_lock);   // 引擎审查修复：g_callback 交换锁
+    g_locks_ready.store(true);
 
     if (!g_gum_inited) {
         gum_init_embedded();
@@ -440,11 +531,25 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeInitEngine(JNIEnv *env, jclass) 
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeSetCallback(JNIEnv *env, jclass, jobject cb) {
+    // 竞态修复：与 on_message（泵线程持续执行）的交换必须原子化。
+    // g_locks_ready 守卫：nativeInitEngine 之前若被调用（防御路径），退化为无锁交换（该阶段无并发）。
+    const bool locked = g_locks_ready.load();
+    if (locked) g_mutex_lock(&g_callback_lock);
     if (g_callback != nullptr) {
         env->DeleteGlobalRef(g_callback);
         g_callback = nullptr;
     }
-    if (cb != nullptr) g_callback = env->NewGlobalRef(cb);
+    g_callback_mid = nullptr;
+    if (cb != nullptr) {
+        g_callback = env->NewGlobalRef(cb);
+        // 缓存 jmethodID：避免每条消息 GetObjectClass + GetMethodID（高频日志路径开销）
+        jclass cls = env->GetObjectClass(cb);
+        if (cls != nullptr) {
+            g_callback_mid = env->GetMethodID(cls, "onScriptMessage", MESSAGE_SIG);
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (locked) g_mutex_unlock(&g_callback_lock);
 }
 
 extern "C"
@@ -455,41 +560,51 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeLoadScript(
     pending_clear_all();   // RouteB：重载前清空在途 replace 请求（等待者回退 proceed）
 
     if (g_backend == nullptr) { LOGE("engine not inited"); return JNI_FALSE; }
-    if (g_script != nullptr) { LOGI("unload previous script first"); /* fallthrough: 先卸旧 */
-        gum_script_unload_sync(g_script, nullptr);
-        g_object_unref(g_script);
-        g_script = nullptr;
+
+    // 竞态修复：锁内摘除旧脚本 → 锁外卸载（卸载耗时，不在锁内做）。
+    // 修复前：g_script 无锁读写，callJs 线程可能在 unload+unref 之后仍解引用 → UAF。
+    g_mutex_lock(&g_script_lock);
+    GumScript *old_script = g_script;
+    g_script = nullptr;
+    g_mutex_unlock(&g_script_lock);
+    if (old_script != nullptr) {
+        LOGI("unload previous script first");
+        gum_script_unload_sync(old_script, nullptr);
+        g_object_unref(old_script);
     }
 
-    const char *src = env->GetStringUTFChars(jscript, nullptr);
-    const char *name = env->GetStringUTFChars(jname, nullptr);
+    // 输入侧 UTF 修复：脚本正文可能含非 BMP 字符（emoji 注释/字符串）
+    gchar *src = lsp_get_utf8(env, jscript, nullptr);
+    gchar *name = lsp_get_utf8(env, jname, "main");
+    if (src == nullptr) src = g_strdup("");
+    if (name == nullptr) name = g_strdup("main");
     GError *error = nullptr;
 
-    g_script = gum_script_backend_create_sync(
+    GumScript *script = gum_script_backend_create_sync(
             g_backend, name, src, nullptr, nullptr, &error);
 
     if (error != nullptr) {
         LOGE("create script error: %s", error->message);
         g_error_free(error);
-        env->ReleaseStringUTFChars(jscript, src);
-        env->ReleaseStringUTFChars(jname, name);
+        g_free(src);
+        g_free(name);
         return JNI_FALSE;
     }
-    if (g_script == nullptr) {
+    if (script == nullptr) {
         // 防御：create 返回 NULL 且未设 error（理论上不应发生），避免后续解引用崩溃
         LOGE("create script returned null (no error set)");
-        env->ReleaseStringUTFChars(jscript, src);
-        env->ReleaseStringUTFChars(jname, name);
+        g_free(src);
+        g_free(name);
         return JNI_FALSE;
     }
 
-    gum_script_set_message_handler(g_script, on_message, nullptr, nullptr);
+    gum_script_set_message_handler(script, on_message, nullptr, nullptr);
 
     // F4：gum_script_load_sync 为 void API（无 GError/无返回值），加载期异常只能通过
     // 消息处理器观测。先清零标记再加载，随后泵队列（异常消息在加载时即入队），
     // 若在加载窗口内收到 {"type":"error",...} 则判定加载失败：卸旧+释放+JNI_FALSE。
     g_load_error_pending.store(false);
-    gum_script_load_sync(g_script, nullptr);   // 零重启热加载
+    gum_script_load_sync(script, nullptr);   // 零重启热加载
 
     // 泵一次主上下文，确保 on_message / send() 在加载后能及时派发
     GMainContext *ctx = g_main_context_default();
@@ -508,11 +623,10 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeLoadScript(
 
     if (g_load_error_pending.load()) {
         LOGE("script [%s] load failed (js error reported)", name);
-        gum_script_unload_sync(g_script, nullptr);
-        g_object_unref(g_script);
-        g_script = nullptr;
-        env->ReleaseStringUTFChars(jscript, src);
-        env->ReleaseStringUTFChars(jname, name);
+        gum_script_unload_sync(script, nullptr);
+        g_object_unref(script);
+        g_free(src);
+        g_free(name);
         return JNI_FALSE;
     }
 
@@ -530,7 +644,7 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeLoadScript(
     {
         gchar *boot = build_rpc_call("lsp-boot-check", "__lspHookReply", "lsp-boot-check",
             "{\"key\":\"boot\",\"args\":[],\"this\":null}");
-        gum_script_post(g_script, boot, nullptr);
+        gum_script_post(script, boot, nullptr);
         g_free(boot);
         // 非阻塞抽干一次（load 泵的延续；若 reply 已回，LOGI 立即出现）
         GMainContext *dctx = g_main_context_default();
@@ -540,8 +654,14 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeLoadScript(
         LOGI("[boot] boot rpc posted (id=lsp-boot-check)");
     }
 
-    env->ReleaseStringUTFChars(jscript, src);
-    env->ReleaseStringUTFChars(jname, name);
+    // 发布新脚本（锁内交换）：此后 callJs/postOriginalReply 才能获取其强引用。
+    // 放在最后一步：保证发布时脚本已完全就绪（加载错误检查、boot 探针、drain 均已完成）。
+    g_mutex_lock(&g_script_lock);
+    g_script = script;
+    g_mutex_unlock(&g_script_lock);
+
+    g_free(src);
+    g_free(name);
     return JNI_TRUE;
 }
 
@@ -549,10 +669,14 @@ extern "C"
 JNIEXPORT void JNICALL
 Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeUnloadScript(JNIEnv *, jclass) {
     pending_clear_all();   // RouteB: 清空在途请求
-    if (g_script != nullptr) {
-        gum_script_unload_sync(g_script, nullptr);
-        g_object_unref(g_script);
-        g_script = nullptr;
+    // 竞态修复：同 nativeLoadScript——锁内摘除、锁外卸载。
+    g_mutex_lock(&g_script_lock);
+    GumScript *old_script = g_script;
+    g_script = nullptr;
+    g_mutex_unlock(&g_script_lock);
+    if (old_script != nullptr) {
+        gum_script_unload_sync(old_script, nullptr);
+        g_object_unref(old_script);
         LOGI("script unloaded");
     }
 }
@@ -568,10 +692,13 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeUnloadScript(JNIEnv *, jclass) {
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeCallJs(JNIEnv *env, jclass, jstring jid, jstring jpayload) {
-    if (g_script == nullptr) return env->NewStringUTF("");
+    // 竞态修复：锁内取强引用（防与 reload 的 unload+unref 竞争 → UAF）；用毕 unref。
+    GumScript *script = lsp_acquire_script();
+    if (script == nullptr) return env->NewStringUTF("");
 
-    const char *id = env->GetStringUTFChars(jid, nullptr);
-    const char *payload = (jpayload != nullptr) ? env->GetStringUTFChars(jpayload, nullptr) : nullptr;
+    // 输入侧 UTF 修复：payload（含用户参数）可能含非 BMP 字符
+    gchar *id = lsp_get_utf8(env, jid, "");
+    gchar *payload = (jpayload != nullptr) ? lsp_get_utf8(env, jpayload, nullptr) : nullptr;
 
     gboolean do_post = (payload != nullptr && payload[0] != '\0');
 
@@ -592,7 +719,7 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeCallJs(JNIEnv *env, jclass, jstr
 
     if (do_post) {
         gchar *msg = build_rpc_call(id, "__lspHookReply", id, payload);
-        gum_script_post(g_script, msg, nullptr);
+        gum_script_post(script, msg, nullptr);
         g_free(msg);
     }
 
@@ -648,11 +775,14 @@ Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeCallJs(JNIEnv *env, jclass, jstr
     }
     g_mutex_unlock(&g_pending_lock);
 
-    jstring jout = env->NewStringUTF(out != nullptr ? out : "");
+    // UTF-8 安全转换（reply 可能含任意用户字符串）
+    jstring jout = lsp_new_jstring(env, out != nullptr ? out : "");
+    if (jout == nullptr) jout = env->NewStringUTF("");
     g_free(out);
 
-    if (payload != nullptr) env->ReleaseStringUTFChars(jpayload, payload);
-    env->ReleaseStringUTFChars(jid, id);
+    g_free(payload);
+    g_free(id);
+    g_object_unref(script);
     return jout;
 }
 
@@ -664,15 +794,19 @@ extern "C"
 JNIEXPORT void JNICALL
 Java_com_bail_lspfrifa_xposed_GumJsBridge_nativePostOriginalReply(
         JNIEnv *env, jclass, jstring jid, jstring jretJson) {
-    if (g_script == nullptr) return;
-    const char *id = env->GetStringUTFChars(jid, nullptr);
-    const char *retJson = (jretJson != nullptr) ? env->GetStringUTFChars(jretJson, nullptr) : "null";
+    // 竞态修复：同 callJs——锁内取强引用，用毕 unref。
+    GumScript *script = lsp_acquire_script();
+    if (script == nullptr) return;
+    // 输入侧 UTF 修复：返回值 JSON 可能含非 BMP 字符
+    gchar *id = lsp_get_utf8(env, jid, "");
+    gchar *retJson = (jretJson != nullptr) ? lsp_get_utf8(env, jretJson, "null") : g_strdup("null");
     gint64 seq = g_orig_seq.fetch_add(1) + 1;
     gchar orig_id[32];
     g_snprintf(orig_id, sizeof(orig_id), "lsp-orig-%lld", (long long) seq);
     gchar *msg = build_rpc_call(orig_id, "__lspHookOriginalReply", id, retJson);
-    gum_script_post(g_script, msg, nullptr);
+    gum_script_post(script, msg, nullptr);
     g_free(msg);
-    if (jretJson != nullptr) env->ReleaseStringUTFChars(jretJson, retJson);
-    env->ReleaseStringUTFChars(jid, id);
+    g_free(retJson);
+    g_free(id);
+    g_object_unref(script);
 }

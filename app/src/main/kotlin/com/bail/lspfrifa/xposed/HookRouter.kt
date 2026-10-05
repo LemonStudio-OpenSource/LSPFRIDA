@@ -145,8 +145,14 @@ class HookRouter(
     private fun flushPending(limit: Int, source: String): Int {
         if (pendingHooks.isEmpty()) return 0
         var done = 0
+        // 预算修复（引擎审查，2026-10-05）：原条件 `done < limit` 只统计“成功挂上”的条数，
+        // 而“类仍未加载”（CNFE，最常见情形）不增 done —— 于是锚点路径（跑在目标主线程）
+        // 会把整个队列扫完，limit=8 形同虚设（队列大时主线程被拖住）。
+        // 改为同时限制“扫描次数”，让 FLUSH_MAX_ITEMS 真正约束主线程工作量。
+        var scanned = 0
         val it = pendingHooks.entries.iterator()
-        while (it.hasNext() && done < limit) {
+        while (it.hasNext() && done < limit && scanned < limit) {
+            scanned++
             val req = it.next().value
 
             // 第一阶段：解析类（决定“出队”还是“留队”）。
@@ -223,8 +229,11 @@ class HookRouter(
                     // 队列非空才做这次扫描；命中才投递（避免每次类加载都排一个消息）
                     val relevant = pendingHooks.values.any { it.clsName == name }
                     if (relevant) {
+                        // 预算修复（引擎审查，2026-10-05）：本 flush 投递到**主线程**执行，
+                        // 原 Int.MAX_VALUE 会在队列大时卡主线程。改为与锚点同额（FLUSH_MAX_ITEMS）——
+                        // 未被本轮处理完的条目由轮询线程（非主线程）接手，不丢功能。
                         mainHandler.post {
-                            runCatching { flushPending(Int.MAX_VALUE, "loadclass") }
+                            runCatching { flushPending(FLUSH_MAX_ITEMS, "loadclass") }
                         }
                     }
                 }

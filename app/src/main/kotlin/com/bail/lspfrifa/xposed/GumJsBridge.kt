@@ -74,7 +74,7 @@ object GumJsBridge {
                     append(JavaBridgeBundle.SCRIPT)
                     append("\n;\n")
                 }
-                append(LSP_SHIM_JAVA)
+                append(LSP_SHIM_JAVA.replace(LSP_ANDROID_VERSION_TOKEN, lspAndroidVersionLiteral()))
                 append("\n;\n")
                 append(scriptContent)
             }
@@ -141,6 +141,11 @@ object GumJsBridge {
      *   其它属性访问/赋值仍抛可读 Error。
      * - argsJson 契约（Kotlin 侧构建，t7 对齐）：`{"key":"<cls>#<method>","args":[...],"this":{...}|null}`；
      *   args 编码=Facts §5：基础类型直 JSON，对象/数组 → `{"__obj":"<simpleName>@<addr>"}` 占位（原样透传）。
+     * - 第十轮（参考官方成员名单逐项裁决）：`performNow`=同 perform（同步直执）；
+     *   `isMainThread`=常量 false（JS 恒在 gum-js-loop 线程）；`androidVersion`=装配时注入
+     *   Build.VERSION.RELEASE；深度 VM API（choose/cast/retain/枚举/deoptimize*/synchronized/
+     *   scheduleOnMainThread）统一为**可读错误 stub**（防静默 undefined，见日志教训）；
+     *   bundle 实例内部状态字段（ClassFactory/classFactory/vm/api）同步中和（链式访问亦得可读错误）。
      */
     private val LSP_SHIM_JAVA: String = """
         (function () {
@@ -151,7 +156,7 @@ object GumJsBridge {
           function __lspErr(msg) { return new Error("[lsp] " + msg); }
           function __lspKey(cls, method) { return cls + "#" + method; }
           function __lspUnsupported(what) {
-            return __lspErr("unsupported: " + what + "（RouteB B1 不实现，请用返回值/参数处理或 observe 语义）");
+            return __lspErr("unsupported: " + what + "（本模块为 LSPlant 路由架构，仅提供 use/perform/performNow/available/isMainThread/androidVersion 子集）");
           }
 
           // ---- t9+B2：async this.method 桥（cap 裁定更新：不再抛错，统一 await 桥；B2 支持自定义参数）----
@@ -365,6 +370,18 @@ object GumJsBridge {
           // 它们被下方 stub 替换为可读错误（choose / registerClass 等），
           // 脚本调用时会得到可读失败而非被 available 探针静默跳过。
           ourJava.available = true;
+          // ---- 第十轮（参考官方 Runtime 原型成员名单补齐；根因=Object.assign 不复制原型成员）----
+          // Java.performNow：官方语义=立即执行、不做延迟排队；本架构 perform 自身即同步直执 → 等价。
+          ourJava.performNow = function (fn) {
+            if (typeof fn !== "function") { throw __lspErr("Java.performNow 需要函数参数"); }
+            return fn();
+          };
+          // Java.isMainThread：官方经 Looper 判定；本架构所有 JS 恒在 gum-js-loop 线程执行
+          // （hook 回调经 frida:rpc 投递到 JS 线程），永不位于 Android 主线程 → 常量 false（保守方向）。
+          ourJava.isMainThread = function () { return false; };
+          // Java.androidVersion：官方为原型 getter（如 "15"）；本架构由 Kotlin 装配时注入
+          // Build.VERSION.RELEASE 真实值（占位符见常量 LSP_ANDROID_VERSION_TOKEN）。
+          ourJava.androidVersion = "__LSP_ANDROID_VERSION__";
 
           // queueMicrotask 兼容补齐（真实缺口，2026-10-05 实核）：
           // QuickJS 内核与 frida runtime 都**未定义** queueMicrotask（grep runtime/*.js 零命中），
@@ -381,8 +398,15 @@ object GumJsBridge {
           // 归属合并（cap 裁定）：use/perform 覆盖同名；bundle 其它 API 保留兼容；无 bundle 时直接 ourJava
           var bundleJava = (typeof globalThis.Java === "object" && globalThis.Java !== null) ? globalThis.Java : null;
           var merged = Object.assign(Object.create(null), bundleJava, ourJava);
-          // B1 明确不实现的 bundle 专有 API：bundle 缺失时给可读错误（避免静默 undefined）
-          ["choose", "register", "registerClass", "openClassFile", "array", "type"].forEach(function (name) {
+          // 参考官方 Runtime 完整原型成员名单逐项裁决（第十轮）：
+          //   已实现：perform / performNow / use / available / isMainThread / androidVersion
+          //   其余需真 VM 对象模型或 VM 枚举能力 → 统一"可读错误 stub"（绝不静默 undefined）
+          var __lspStubMembers = ["choose", "register", "registerClass", "openClassFile", "array", "type",
+            "cast", "retain", "backtrace", "enumerateLoadedClasses", "enumerateLoadedClassesSync",
+            "enumerateClassLoaders", "enumerateClassLoadersSync", "enumerateMethods",
+            "deoptimizeEverything", "deoptimizeBootImage", "deoptimizeMethod",
+            "scheduleOnMainThread", "synchronized"];
+          __lspStubMembers.forEach(function (name) {
             if (!(name in merged)) {
               Object.defineProperty(merged, name, {
                 configurable: true, enumerable: true,
@@ -390,9 +414,35 @@ object GumJsBridge {
               });
             }
           });
+          // 合并从 bundle 实例复制的是【自有字段】（classFactory/vm/api/ClassFactory —— 均为内部状态，
+          // 非 API；官方 API 全在类体/原型上）。这些半初始化字段泄漏会产生迷惑性 TypeError
+          // （如 Cannot read property 'use' of null）——统一中和为可读错误：直接调用、或经常见
+          // 链式访问（.use/.get/.perform/.performNow）都得同一指引；属性枚举不抛（Introspection-safe）。
+          function __lspTrap(what) {
+            var f = function () { throw __lspUnsupported(what); };
+            ["use", "get", "perform", "performNow"].forEach(function (k) { f[k] = f; });
+            return f;
+          }
+          ["ClassFactory", "classFactory", "vm", "api"].forEach(function (name) {
+            Object.defineProperty(merged, name, {
+              configurable: true, enumerable: true,
+              value: __lspTrap("Java." + name)
+            });
+          });
           globalThis.Java = merged;
         })();
     """.trimIndent()
+    /**
+     * API 面装配：LSP_SHIM_JAVA 中 `ourJava.androidVersion` 的字面量占位 token；
+     * loadScript 装配时替换为 Build.VERSION.RELEASE 的真实 JSON 字符串（如 "15"）。
+     */
+    private const val LSP_ANDROID_VERSION_TOKEN = "\"__LSP_ANDROID_VERSION__\""
+    /** 目标进程内读 Build.VERSION.RELEASE → JSON 安全字符串字面量（模块运行于目标进程）。 */
+    private fun lspAndroidVersionLiteral(): String {
+        val release = try { android.os.Build.VERSION.RELEASE } catch (_: Throwable) { null }
+        val safe = (release ?: "0").replace("\\", "\\\\").replace("\"", "\\\"")
+        return "\"" + safe + "\""
+    }
 
     @Synchronized
     fun unloadScript() {

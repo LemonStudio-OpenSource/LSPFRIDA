@@ -578,6 +578,38 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 - clang++ -fsyntax-only（NDK 28 sysroot）：0 错；反向验证（故意破坏）正确报错
 - check-kt.sh 双绿；花括号净值全平衡
 
+### 第十轮：API 面收敛（参考官方“契约”，不参考“实现”——2026-10-05）
+> **背景（事实核查实测）**：官方 Runtime 的 API 全部定义在**类体（=原型）**上，而我们的装配
+> `Object.assign(Object.create(null), bundleJava, ourJava)` 只复制**自有字段** → 合并后官方 API
+> 实际全部丢失，此前仅 `use/perform/available` 因被显式覆盖而幸免（`performNow` 等早已缺失，
+> 因为脚本未用而未暴露）。
+>
+> **第一性原理**：脚本的迁移成本由**契约**（脚本可见的名字/语义/错误行为）决定，不由**实现**（hook 引擎）决定。
+> → 契约层必须参考；实现层不可参考（本模块 devkit 实测 `nm` 零命中 frida java bridge 原生符号，
+> `ArtController/MethodMangler` 等一行都不会执行；且其 ART 偏移方案跨版本脆弱，正是选 LSPlant 的原因）。
+
+#### 裁决表（官方 Runtime 成员 → 本模块处置）
+| 官方成员/字段 | 处置 | 依据 |
+|---|---|---|
+| `perform` | 已实现 | 本架构=同步直执（无 VM attach 概念） |
+| `performNow` | **本轮补实现** | 官方=立即执行；与本架构 perform 等价 |
+| `use` | 已实现 | ClassWrapper → HookRouter 注册 |
+| `available` | 已实现（常量 true） | 目标进程必有 JVM；深度 API 由 stub 报错而非 available 静默跳过 |
+| `isMainThread` | **本轮补实现**（常量 false） | JS 恒在 gum-js-loop 线程执行（hook 回调经 frida:rpc 投递），保守方向 |
+| `androidVersion` | **本轮补实现**（装配时注入 Build.VERSION.RELEASE） | 官方为 getter；token 字面量替换（LSP_ANDROID_VERSION_TOKEN） |
+| `choose/register/registerClass/openClassFile/array/type` | 可读错误 stub | 需真 VM 对象模型 |
+| `cast/retain/backtrace/enumerate*/deoptimize*/synchronized/scheduleOnMainThread` | **本轮补 stub**（原为静默 undefined） | 同上；统一可读报错，绝不静默 |
+| `ClassFactory/classFactory/vm/api`（自有字段） | **本轮补“陷阱”中和** | 内部状态非 API；防链式访问 `Cannot read property of null` 迷惑性 TypeError |
+
+#### 明确不参考（排除项）
+- `ArtController`/`MethodMangler`/`class-model.js` 的 CModule 编译（ART 内部偏移方案，跨版本脆弱）。
+- `api_default`/`VM`/`Env` 原生层（devkit 不含其原生符号，实测 `nm` 零命中 → 初始化链不可能跑起来）。
+
+#### 改动文件 / 验证
+- `GumJsBridge.kt`：+`performNow`/`isMainThread`/`androidVersion`（token 注入）/ +19 项 stub 名单 / +4 项陷阱字段。
+- 验证：`node --check` + 反向验证（故意破坏能报错）；真实合并模拟（模拟 bundle Runtime + 新 shim）
+  → 7 项 stub 全部可读报错、4 项陷阱链式访问均得同一指引、`Object.keys(Java)` 完整枚举不抛。
+
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 
 - **工作流 1**：宿主冷启动前先启动目标 → 脚本应仍注入成功（`load_persisted_script src=remote_prefs`）；

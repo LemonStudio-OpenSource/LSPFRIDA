@@ -203,3 +203,14 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 2. 监听安装失败仅降级（`CLASSLOADER_WATCH_FAIL`），不阻断注入——监听本属优化。
 3. 待挂队列的**去重维度是 `cls#method#tag`（不含签名）**：同 tag 同方法的不同 overload 视为一项，
    真正区分在挂载时由 `sigs` 完成。若发现“只挂了一个 overload”，先查是否脚本未调 `overload()`。
+
+## J. API 面收敛（第十轮）—— 与 W1–W4 独立，可随时验
+| # | 操作 | 预期 |
+|---|---|---|
+| J1 | 脚本顶层调用 `Java.performNow(fn)` | 不再 `is not a function`；fn 立即执行 |
+| J2 | `Java.isMainThread()` | 返回 false（不抛） |
+| J3 | 读 `Java.androidVersion` | 字符串 = 设备实际 Android 版本（如 `"15"`） |
+| J4 | 调用 `Java.cast(...)`（及 retain/backtrace/enumerate*/deoptimize*/synchronized/scheduleOnMainThread） | `[lsp] unsupported: Java.xxx（本模块为 LSPlant 路由架构…）` 可读错误；**不得**出现 `is not a function` 或静默 undefined |
+| J5 | 链式访问 `Java.ClassFactory.use(...)` / `Java.classFactory.get(...)` / `Java.vm` | 同一可读错误指引；**不得**是 `Cannot read property 'use' of null` |
+| J6 | 回归：`Java.available` / `Java.perform` / `Java.use(...).implementation` 全链 | 行为与上一轮完全一致 |
+| J7 | **日志防静默验证**：搜全量日志 | 不得出现 `Cannot read propert`、`is not a function` 类原始 TypeError（出现即说明有漏网成员） |

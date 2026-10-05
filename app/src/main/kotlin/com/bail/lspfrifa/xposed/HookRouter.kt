@@ -249,7 +249,16 @@ class HookRouter(
     private companion object {
         /**
          * D3②：轮询间隔。与设计文档 D3 一致（200ms）。
-         * 为何调度必须在 Kotlin/Java 侧：devkit QuickJS 未实现 setInterval/setTimeout（已实证）。
+         *
+         * 【2026-10-05 更正】原注释写“devkit QuickJS 未实现 setInterval/setTimeout”——**该结论错误**。
+         * 实核：devkit 完整实现 timer（gumquickcore.c: JS_CFUNC_DEF("_setTimeout"/"_setInterval")
+         * → gum_quick_core_schedule_callback → g_timeout_source_new 挂 js_context，
+         * 由 gum-js-loop 调度器泵送；core.js 把 setTimeout/setInterval/setImmediate 暴露为全局）。
+         * 旧误诊来源：用户脚本心跳的**输出**（send）长期不可见（缺常驻泵，已于 e659ce9 修复），
+         * 叠加当时探针恰好中断，被误判为“timer 不触发”。
+         *
+         * 本调度仍留在 Kotlin 侧——**不是**因为缺 timer，而是设计选择：
+         * 不依赖用户脚本执行状态、不受脚本异常影响、可在无脚本时独立运行。
          */
         const val POLL_INTERVAL_MS = 200L
 

@@ -366,6 +366,18 @@ object GumJsBridge {
           // 脚本调用时会得到可读失败而非被 available 探针静默跳过。
           ourJava.available = true;
 
+          // queueMicrotask 兼容补齐（真实缺口，2026-10-05 实核）：
+          // QuickJS 内核与 frida runtime 都**未定义** queueMicrotask（grep runtime/*.js 零命中），
+          // 而它已进入现代脚本常用 API。若用户脚本顶层调用它 → ReferenceError →
+          // **整个脚本终止**（含后续 timer 注册），与历史“timer 不触发”误诊的症状完全一致。
+          // 实现：Promise.resolve().then() 就是标准的微任务排队语义（QuickJS 原生 Promise）。
+          if (typeof globalThis.queueMicrotask !== "function") {
+            globalThis.queueMicrotask = function (fn) {
+              if (typeof fn !== "function") { throw new TypeError("queueMicrotask 需要函数参数"); }
+              return Promise.resolve().then(fn);
+            };
+          }
+
           // 归属合并（cap 裁定）：use/perform 覆盖同名；bundle 其它 API 保留兼容；无 bundle 时直接 ourJava
           var bundleJava = (typeof globalThis.Java === "object" && globalThis.Java !== null) ? globalThis.Java : null;
           var merged = Object.assign(Object.create(null), bundleJava, ourJava);

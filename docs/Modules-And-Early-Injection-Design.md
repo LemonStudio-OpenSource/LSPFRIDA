@@ -59,7 +59,8 @@
 ### D3 — 类加载感知的实现形态：三级再武装（默认开 ①②，③ 可开关）
 1. **锚点 flush（零成本，必做）**：在既有锚点（`callApplicationOnCreate` proceed 前）flush 待挂队列。
 2. **Kotlin 侧调度（必做）**：待挂队列非空时，用 Java 侧线程每 200ms 重试；队列空即停止。
-   ⚠️ **不能用 JS timer**——devkit QuickJS 未实现 `setInterval/setTimeout`（本项目已实证），故调度必须在 Kotlin/Java 侧。
+   ℹ️ **【2026-10-05 更正】timer 可用**——原写“devkit QuickJS 未实现 `setInterval/setTimeout`”**系误诊**（实核：devkit 完整实现，见 gumquickcore.c/core.js）。
+   本调度仍留在 Kotlin/Java 侧是**设计选择**（不依赖脚本执行状态、不受脚本异常影响、无脚本时也能跑），而非能力限制。
 3. **`ClassLoader.loadClass` 拦截（激进模式，设置项开关）**：前缀白名单 + 待挂队列为空时立即 return +
    **proceed 之后再 post 补挂**（绝不在 intercept 内同步装新 hook，防递归）。
 
@@ -251,7 +252,8 @@ modules                    : StringSet(moduleId)   # 该包启用的模块集
 1. 模块内死循环 → 僵死 JS 线程 → 全部模块的 replace 退化为 observe（单线程事件循环，无抢占）。
 2. 对象参数/返回值仍为 `__obj` 占位（B1/B2 既定边界）。
 3. 部分 hook 时机硬性不可达：类加载前不存在 ArtMethod；D 档把窗口缩到"类加载瞬间"，不等于零延迟。
-4. devkit QuickJS 无 timer → 所有定时/心跳类逻辑必须在 Kotlin/Java 侧。
+4. ~~devkit QuickJS 无 timer~~ **【2026-10-05 更正：误诊】** → timer 完整可用（`setTimeout/setInterval/setImmediate`）；
+   Kotlin 侧调度是设计选择。**真实缺口**：`queueMicrotask` 未定义 → 已在 shim 补。
 5. **远程文件通道只写不了**：宿主无法向目标进程推送文件，所以脚本分发完全依赖 remote prefs（受 group 1MB 上限约束，见 D5/D15）。
 6. **remote prefs 无事务语义**：`Editor.apply()` 失败仅打日志（`Failed to commit changes to framework`），调用方无从得知——写入必须靠读回验证。
 
@@ -500,6 +502,37 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 2. **`handleToastMessage` context 缺失语义**：原 `appContext ?: return true` 会把
    `lsp.toast` 当作“已消费”静默吞掉（提前阶段必然无 Context）→ 现改为 `return false`，
    让消息走未消费分支入 EarlyLogBuffer 补发（日志：`[lsp-toast] deferred (no context yet)`）。
+
+### 第八轮更正与补缺（timer 误诊平反 + queueMicrotask — 2026-10-05）
+
+> 由用户提问触发复查（“不是说引擎不含 timer 吗”）。复查结果：**该结论系误诊**，
+> 并顺带找到一个**真实缺口**（queueMicrotask）。
+
+#### 更正：timer 从未缺失
+- **实核证据**：
+  - `gumquickcore.c`：`JS_CFUNC_DEF("_setTimeout"/"_setInterval", ...)` →
+    `gum_quick_core_schedule_callback` → `g_idle_source_new`/`g_timeout_source_new`
+    → `g_source_attach(..., gum_script_scheduler_get_js_context(...))`（js_context 挂载）。
+  - `gumscriptscheduler.c`：`js_loop = g_main_loop_new(js_context, TRUE)` + `g_thread_new("gum-js-loop")`
+    → **js_context 由常驻调度器线程泵送**（与本次修的默认 context 不同！）。
+  - `core.js`：`setTimeout/setInterval/setImmediate/clearTimeout/clearInterval` 均为全局。
+- **真机实证**：用户脚本（重度使用 `setInterval`）的日志中，`linker patched`、`engine poll`、
+  `PF2_SEED` 等均由定时器驱动，且种子文件（1460 行）持续写入 → **timer 一直在工作**。
+- **误诊成因**：脚本出站消息（send）缺常驻泵（已于 `e659ce9` 修复）→ 心跳“看起来不触发”；
+  叠加历史探针恰好被 `queueMicrotask` ReferenceError 中断（见下）→ 错误归因到 timer。
+
+#### 真实缺口：queueMicrotask 未定义（已补）
+- QuickJS 内核与 frida runtime **均未定义** `queueMicrotask`（grep 零命中）。
+- 后果：脚本顶层调用 → ReferenceError → **整个脚本终止**（含后续 timer 注册）——
+  与历史“timer 不触发”的症状完全一致（**这才是真因之一**）。
+- 修复：shim 内补齐（`Promise.resolve().then` 标准微任务语义）。
+
+#### 改动文件
+| 文件 | 改动 |
+|---|---|
+| `GumJsBridge.kt` | shim 补 `queueMicrotask` |
+| `HookRouter.kt` | 轮询注释更正（timer 误诊 → 设计选择） |
+| `Handoff / Design / Checklist` | 三处 timer 误诊记载全部更正 |
 
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 

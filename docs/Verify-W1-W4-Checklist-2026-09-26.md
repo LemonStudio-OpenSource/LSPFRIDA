@@ -125,7 +125,9 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 
 ## H. 已知限制（勿当 bug 报）
 
-1. devkit QuickJS **无 timer**（`setInterval/setTimeout` 未实现）→ 心跳类探针不判失败；所有定时逻辑在 Kotlin 侧。
+1. ~~devkit QuickJS **无 timer**（`setInterval/setTimeout` 未实现）~~ **【2026-10-05 更正：误诊】**
+   → timer 完整可用；心跳类探针**可正常使用**。Kotlin 侧调度是设计选择而非限制。
+   真实缺口：`queueMicrotask` 未定义（已补 shim）。
 2. 对象参数/返回值仍为 `__obj` 占位（B1/B2 既定边界）。
 3. 远程文件通道**只读**（宿主无法向目标推送文件）→ 脚本分发必须走 remote prefs。
 4. remote prefs **无事务语义**：`Editor.apply()` 失败仅打日志 → 写入靠**读回验证**。

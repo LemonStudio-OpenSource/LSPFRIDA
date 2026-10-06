@@ -143,8 +143,8 @@ object GumJsBridge {
      *   args 编码=Facts §5：基础类型直 JSON，对象/数组 → `{"__obj":"<simpleName>@<addr>"}` 占位（原样透传）。
      * - 第十轮（参考官方成员名单逐项裁决）：`performNow`=同 perform（同步直执）；
      *   `isMainThread`=常量 false（JS 恒在 gum-js-loop 线程）；`androidVersion`=装配时注入
-     *   Build.VERSION.RELEASE；深度 VM API（choose/cast/retain/枚举/deoptimize*/synchronized/
-     *   scheduleOnMainThread）统一为**可读错误 stub**（防静默 undefined，见日志教训）；
+     *   Build.VERSION.RELEASE；深度 VM API（choose / cast / retain / 枚举 / deoptimize 系列 /
+     *   synchronized / scheduleOnMainThread）统一为**可读错误 stub**（防静默 undefined，见日志教训）；
      *   bundle 实例内部状态字段（ClassFactory/classFactory/vm/api）同步中和（链式访问亦得可读错误）。
      */
     private val LSP_SHIM_JAVA: String = """

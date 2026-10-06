@@ -28,6 +28,13 @@ for f in $files; do
   scan "$f" "sora-fake-setLineNumberEnabled" "setLineNumberEnabled"
   # 5. @Composable 调用被包进非 @Composable lambda（runCatching { <composable> } 模式）
   scan "$f" "runCatching包裹Composable调用" "runCatching\s*\{[^}]{0,120}(dynamicLightColorScheme|rememberLayerBackdrop|textureBlur)"
+  # 9. KDoc/块注释行内提前闭合（`*/` 出现在注释续行中间）
+  #    后果：注释被提前终止，其后文本被当作 Kotlin 代码 → 编译器刷屏
+  #    "Syntax error: Expecting member declaration"（本项目实证 38 条，2026-10-05）。
+  #    模式：行首=空白+`*`（非 `*/`），行内出现 `*/` → 命中。
+  #    不误报 ` */` 终止符（其后无字符）、`/** x */` 单行注释（不以 * 开头）、
+  #    `/* @__PURE__ */`（不以 * 开头）。
+  scan "$f" "KDoc提前闭合(*/后仍有文本)" '^[[:blank:]]*\*([^*]|\*[^/])*\*/[[:blank:]]*[^[:blank:]]'
   # 6. 非 import 语句插在 import 区（const 夹在 package 与 import 之间）
   if awk 'NR<=3 || /^import /' "$f" | grep -qE '^(private |public |internal |object |val |fun |class )' && \
      ! head -3 "$f" | grep -qE '^(private |public |internal |object |val |fun |class )'; then

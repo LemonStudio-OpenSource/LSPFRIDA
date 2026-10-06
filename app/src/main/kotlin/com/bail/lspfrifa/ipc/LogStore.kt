@@ -342,6 +342,23 @@ object LogStore {
      * 返回最近 [limit] 行（时间正序，行内自带时间戳）。
      * 内存有界：逐行读入并只保留尾部 [limit] 行。
      */
+    /**
+     * P0-2：最新日志文件的"签名"（文件名:长度:修改时间）。
+     *
+     * 用途 = 日志页 3s 兜底轮询的**快路径**：签名与上次相同 ⇒ 文件无新增 ⇒ 直接跳过解析。
+     * 收益：把"每 3 秒全量读盘（[tailLines] 逐行读完整个文件，上限 5000 行）"降为
+     * "每 3 秒一次 O(1) stat" —— 这是日志页最主要的周期性主线程外负担。
+     *
+     * 返回 null 表示目录不存在或无日志文件（调用方按"无变化"处理即可）。
+     */
+    fun latestFileSignature(packageName: String): String? {
+        val root = rootDir ?: return null
+        val dir = File(root, packageName)
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".log") } ?: return null
+        val latest = files.maxByOrNull { it.name } ?: return null
+        return latest.name + ":" + latest.length() + ":" + latest.lastModified()
+    }
+
     fun readHistory(packageName: String, limit: Int = 500): List<String> {
         if (limit <= 0) return emptyList()
         val root = rootDir ?: return emptyList()

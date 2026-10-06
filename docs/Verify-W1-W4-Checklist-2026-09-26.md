@@ -214,3 +214,15 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 | J5 | 链式访问 `Java.ClassFactory.use(...)` / `Java.classFactory.get(...)` / `Java.vm` | 同一可读错误指引；**不得**是 `Cannot read property 'use' of null` |
 | J6 | 回归：`Java.available` / `Java.perform` / `Java.use(...).implementation` 全链 | 行为与上一轮完全一致 |
 | J7 | **日志防静默验证**：搜全量日志 | 不得出现 `Cannot read propert`、`is not a function` 类原始 TypeError（出现即说明有漏网成员） |
+
+## K. 体积与性能（第十一轮 P0）—— 独立可验
+| # | 操作 | 预期 |
+|---|---|---|
+| K1 | 查看 APK 内容 | **只有 `lib/arm64-v8a/`**，无 `lib/armeabi-v7a/` |
+| K2 | 记录 APK 体积 | 约 60 MB（原 87 MB，-27 MB） |
+| K3 | 日志页：脚本高频输出（engine poll 级）时观察 | 列表流畅追加；**不再卡顿**；日志仍"看起来实时"（≤200ms 延迟） |
+| K4 | 日志页长时间停留（≥1 分钟） | CPU 占用低（3s 轮询走 stat 快路径，无全量读盘） |
+| K5 | 日志页上下滚动 | 滚动流畅；顶栏 blur 在滚动中消失、松手恢复（P0-3 预期行为，非 bug） |
+| K6 | 日志页清除后继续有新日志 | 不自动回灌（cleared 防护） |
+| K7 | 日志页进入时已有历史 + 实时正在输出 | 顺序正确（历史在前、实时在后），无错位 |
+| K8 | 回归：详情页/编辑页顶栏玻璃效果 | 与之前一致（blurEnabled 默认 true，零回归） |

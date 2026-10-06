@@ -78,6 +78,14 @@ private const val MAX_LOG_LINES = 500
 /** 实时标志窗口：最近收到上行日志的毫秒数内视为"有实时流"。 */
 private const val LIVE_WINDOW_MS = 3000L
 
+/**
+ * P0-2：入站日志批量 flush 间隔（毫秒）。
+ * 依据：原实现每条日志一次 `logs.add` → 一次 state 写 → 一次重组；脚本高频输出
+ * （实测 engine poll 50ms 一轮、多行）时主线程被重组淹没。
+ * 该值把重组频率上限压到约 5 次/秒，同时保持"看起来实时"的观感。
+ */
+private const val LOG_FLUSH_MS = 200L
+
 // ==================== t3 定稿：日志页（现代日志查看器范式） ====================
 
 /**
@@ -137,6 +145,12 @@ fun LogScreenV1(
 ) {
     val logs = remember { mutableStateListOf<String>() }
     val scope = rememberCoroutineScope()
+    // P0-2：入站日志批量缓冲（普通 ArrayList，非 Compose state —— 追加不触发重组）。
+    // 回调线程可能不是主线程，故全部访问走 synchronized；state 写入统一由 flush 协程
+    // 在 LaunchedEffect（主线程）内完成。
+    val pending = remember { ArrayList<String>(64) }
+    // P0-2：实时心跳时间戳（回调线程写、flush 协程读后写入 state，避免非主线程写 state）
+    val lastLiveAtRef = remember { java.util.concurrent.atomic.AtomicLong(0L) }
 
     // 实时流心跳：最近一次上行日志时间（实时标识；无实时流时不显示）
     var lastLiveAt by remember { mutableStateOf(0L) }
@@ -161,16 +175,29 @@ fun LogScreenV1(
             withContext(Dispatchers.Main) {
                 if (disposed) return@withContext
                 logs.addAll(history)
-                while (logs.size > MAX_LOG_LINES) logs.removeAt(0)
+                // P0-2：合并"历史读取期间已缓冲的实时行"——否则它们会被后续 flush 追加，
+                // 但顺序上应位于历史之后（若 flush 先跑过，此处取到空，同样正确）。
+                val early = synchronized(pending) {
+                    if (pending.isEmpty()) null else ArrayList(pending).also { pending.clear() }
+                }
+                if (early != null) logs.addAll(early)
+                // P0-2：一次性裁剪（原 while + removeAt(0) = n 次 O(n) 搬移 + n 次重组）。
+                // 用 toList/clear/addAll 三个基本成员（不用 removeRange 扩展——其在本
+                // SnapshotStateList 上的行为未经本地验证，按"静态双绿≠可编译"教训取保守写法）。
+                if (logs.size > MAX_LOG_LINES) {
+                    val kept = logs.toList().takeLast(MAX_LOG_LINES)
+                    logs.clear()
+                    logs.addAll(kept)
+                }
                 unsubscribe = IpcManager.addLogListener { target, message ->
                     if (target == packageName) {
-                        lastLiveAt = System.currentTimeMillis()
+                        lastLiveAtRef.set(System.currentTimeMillis())
                         // t9-2：实时行无时间戳前缀（logReceiverStub 直发原始消息）→ 本地兜底补齐，
                         // 否则实时到达的日志显示缺时间戳（重进读历史才有）
                         val stamped = if (LogLinePrefix.containsMatchIn(message)) message
                         else "[${RowTimeFormatter.format(LocalDateTime.now())}] $message"
-                        logs.add(stamped)
-                        if (logs.size > MAX_LOG_LINES) logs.removeAt(0)
+                        // P0-2：入缓冲（不直接改 state）—— 重组由 flush 协程按 LOG_FLUSH_MS 节流
+                        synchronized(pending) { pending.add(stamped) }
                     }
                 }
             }
@@ -181,12 +208,44 @@ fun LogScreenV1(
         }
     }
 
+    // P0-2：批量 flush —— 把"每条日志一次重组"降为"每 LOG_FLUSH_MS 一次"。
+    // 同时把心跳时间戳从回调线程转移到主线程写入 state。
+    LaunchedEffect(packageName) {
+        while (true) {
+            delay(LOG_FLUSH_MS)
+            // P0-2：清除后停止回灌（与 3s 轮询的 cleared 防护语义一致）
+            if (cleared) {
+                synchronized(pending) { pending.clear() }
+                continue
+            }
+            val batch = synchronized(pending) {
+                if (pending.isEmpty()) null else ArrayList(pending).also { pending.clear() }
+            }
+            if (batch != null) {
+                logs.addAll(batch)
+                // P0-2：一次性裁剪（O(n) 一次，替代每条一次 removeAt(0)）；同上的保守 API 选择。
+                if (logs.size > MAX_LOG_LINES) {
+                    val kept = logs.toList().takeLast(MAX_LOG_LINES)
+                    logs.clear()
+                    logs.addAll(kept)
+                }
+            }
+            val live = lastLiveAtRef.get()
+            if (live != lastLiveAt) lastLiveAt = live
+        }
+    }
+
     // t9：3s 轮询兜底——实时订阅可能因时序/后台漏收；以 LogStore 队列为准增量补齐
     // （尾部相同=无新行；尾部不同=按上次尾部定位后追加；cleared 后暂停自动重载）
     LaunchedEffect(packageName) {
+        var lastSig: String? = null
         while (true) {
             delay(3000)
             if (cleared) continue
+            // P0-2 快路径：文件签名未变 ⇒ 无新行 ⇒ 跳过全量读盘（这是本页最主要的周期开销）
+            val sig = withContext(Dispatchers.IO) { LogStore.latestFileSignature(packageName) }
+            if (sig != null && sig == lastSig) continue
+            lastSig = sig
             val h = withContext(Dispatchers.IO) { LogStore.readHistory(packageName, MAX_LOG_LINES) }
             if (h.size > logs.size && h.isNotEmpty() && logs.isNotEmpty() && h[h.size - 1] != logs[logs.size - 1]) {
                 val start = h.indexOf(logs[logs.size - 1])
@@ -199,9 +258,13 @@ fun LogScreenV1(
     val listState = rememberLazyListState()
     val dragged by listState.interactionSource.collectIsDraggedAsState()
     var pinnedToBottom by remember { mutableStateOf(true) }
+    // P0-3：滚动中标记 —— 滚动期间临时关闭顶栏 blur（每帧重捕获纹理做模糊是最贵的
+    // Compose 效果之一；滚动时视觉差异不可辨，松手即恢复）
+    var scrolling by remember { mutableStateOf(false) }
     LaunchedEffect(listState) {
         snapshotFlow { listState.isScrollInProgress }
             .collect { inProgress ->
+                scrolling = inProgress
                 if (!inProgress) {
                     val info = listState.layoutInfo
                     val total = info.totalItemsCount
@@ -215,7 +278,9 @@ fun LogScreenV1(
     }
     LaunchedEffect(logs.size) {
         if (pinnedToBottom && logs.isNotEmpty()) {
-            listState.animateScrollToItem(logs.size - 1)
+            // P0-2：瞬时定位替代 animateScrollToItem —— 高频追加时动画会被每批 flush
+            // 反复取消/重启，既浪费帧又永远追不上；追尾语义下瞬时定位更正确。
+            listState.scrollToItem(logs.size - 1)
         }
     }
     // 回到底部：恢复追尾 + 滚到末项
@@ -255,7 +320,7 @@ fun LogScreenV1(
     Scaffold(
         containerColor = MiuixPageBackground(),
         topBar = {
-            GlassTopAppBar(backdrop) {
+            GlassTopAppBar(backdrop, blurEnabled = !scrolling) {
                 // t3 紧凑顶栏：Miuix SmallTopAppBar（0.9.4-rc01 实核：title+subtitle+actions；
                 // 返回 + 标题"日志" + 应用名副标 + 清除 action）
                 SmallTopAppBar(

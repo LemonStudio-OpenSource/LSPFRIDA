@@ -42,13 +42,16 @@ fun Modifier.glassSurface(
     shape: Shape,
     tint: Color,
     blurRadius: Float = UiTokens.GlassBlurRadius,
+    blurEnabled: Boolean = true,
 ): Modifier {
     val dark = when (MiuixTheme.colorSchemeMode) {
         ColorSchemeMode.Dark, ColorSchemeMode.MonetDark -> true
         ColorSchemeMode.Light, ColorSchemeMode.MonetLight -> false
         else -> isSystemInDarkTheme()
     }
-    return if (isRuntimeShaderSupported()) {
+    // P0-3：blurEnabled=false 时走纯色降级（textureBlur 内部 effectiveEnabled 亦会短路，
+    // 这里提前分支省掉 backdrop 采样与 shader 管线构建）。用于滚动等高频重绘场景。
+    return if (isRuntimeShaderSupported() && blurEnabled) {
         textureBlur(
             backdrop = backdrop,
             shape = shape,
@@ -76,6 +79,7 @@ fun Modifier.glassSurface(
 @Composable
 fun GlassTopAppBar(
     backdrop: LayerBackdrop,
+    blurEnabled: Boolean = true,
     content: @Composable () -> Unit,
 ) {
     Box(
@@ -85,6 +89,7 @@ fun GlassTopAppBar(
                 backdrop = backdrop,
                 shape = RectangleShape,
                 tint = MiuixTheme.colorScheme.surface,
+                blurEnabled = blurEnabled,
             ),
     ) {
         content()

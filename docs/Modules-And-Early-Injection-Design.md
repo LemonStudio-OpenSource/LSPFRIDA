@@ -610,6 +610,60 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 - 验证：`node --check` + 反向验证（故意破坏能报错）；真实合并模拟（模拟 bundle Runtime + 新 shim）
   → 7 项 stub 全部可读报错、4 项陷阱链式访问均得同一指引、`Object.keys(Java)` 完整枚举不抛。
 
+### 第十一轮：体积与性能优化（P0 —— 2026-10-06）
+> 触发：用户反馈"应用卡顿 + 体积庞大"。全部结论基于**实测数据**（APK zip 拆解 + readelf 节区 + 源码热点定位）。
+
+#### A. 体积：87 MB 的构成（实测）
+| 类别 | 压缩后 | 占比 | 根因 |
+|---|---|---|---|
+| `lib/arm64-v8a/libgumjs_bridge.so` | 37.95 MB | 44% | 静态链接 libfrida-gumjs.a；未做导出裁剪 |
+| `lib/armeabi-v7a/libgumjs_bridge.so` | 27.19 MB | 32% | 32 位冗余分支 |
+| dex × 14 | 17.67 MB | 21% | **无 buildTypes 块 → R8 完全未开** |
+| resources.arsc | 1.46 MB | 2% | 未开资源压缩 |
+| 其它 | 1.6 MB | 1% | — |
+
+`.so` 节区实测（arm64）：`.text` 12.32 MB / `.rodata` 7.34 MB / **`.dynstr` 5.42 MB + `.dynsym` 1.45 MB = 6.87 MB 纯符号**；
+动态导出符号 **63066 个**（多为 `frida__ZN...` C++ mangled 名，运行时用不到）。
+
+#### B. 已实施：P0-1 砍 32 位（用户裁定）
+- `abiFilters` → 仅 `arm64-v8a`。
+- **依据**：验证环境小米 23013RK75C / A15 为 arm64；armeabi-v7a 的 `.so` 占全包 32%，零收益纯负担。
+- devkit 的 `armeabi-v7a/` 目录**保留未删**（138 MB），需要时把 ABI 加回一行即可。
+- 预期收益：**-27.19 MB**（APK 从 87 MB → ~60 MB）。
+- **未做（用户裁定"先不管"）**：导出符号裁剪（`--exclude-libs,ALL` + version script）可再省 ~7 MB/ABI，
+  但用户保留"以后可能有用"，故不动。
+
+#### C. 已实施：P0-2 日志页三机制修复（卡顿主因）
+第一性原理：主线程每帧预算 16.6 ms，超预算即掉帧。三个独立机制：
+
+| # | 原实现 | 问题 | 修复 |
+|---|---|---|---|
+| ① | 监听回调内直接 `logs.add(...)` | **每条日志一次 state 写 → 一次重组**；高频脚本（engine poll 50ms）下每秒数十次 | 新增 `pending` 普通 ArrayList 缓冲 + `LaunchedEffect` 每 **200ms** 批量 flush → 重组频率上限 ~5 次/秒 |
+| ② | `while (logs.size > MAX) logs.removeAt(0)` | **n 次 O(n) 搬移 + n 次重组** | 改为一次性裁剪（`toList().takeLast(n)` + `clear` + `addAll`） |
+| ③ | 3s 轮询 `readHistory()` | **每 3 秒逐行读完整个日志文件**（上限 5000 行） | 新增 `LogStore.latestFileSignature()`（name:length:mtime）；签名未变 ⇒ 跳过解析，降为 O(1) stat |
+
+附带修复（自查发现）：
+- 心跳时间戳 `lastLiveAt` 原由**回调线程直接写 state** → 改 `AtomicLong` + 主线程 flush 时同步（消除跨线程 state 写）。
+- 历史读取期间缓冲的实时行会**插到历史之前** → 在历史装载处先合并 `pending`（保序）。
+- `cleared` 后 flush 会回灌 → 加 `cleared` 防护（与 3s 轮询语义一致）。
+- 追尾滚动 `animateScrollToItem` → `scrollToItem`（高频追加下动画被反复取消/重启，永远追不上）。
+
+#### D. 已实施：P0-3 滚动期 blur 降级
+- `glassSurface` / `GlassTopAppBar` 新增 `blurEnabled: Boolean = true` 参数（默认值 = 零回归）。
+- 日志页滚动中（`listState.isScrollInProgress`）临时走纯色降级，松手即恢复。
+- 依据：`textureBlur` 每帧重捕获内容层纹理做 RuntimeShader 高斯模糊，是当前最贵的 Compose 效果。
+- 调用点安全性已核查：`GlassTopAppBar` 的 `content` 为尾随 lambda、`blurEnabled` 为命名参数 → 无位置错配。
+
+#### E. 明确不做（本轮）
+- 导出符号裁剪（用户保留）。
+- R8/minifyEnabled：**无 `buildTypes` 块**是 17.67 MB dex 的根因，但开 R8 需处理 libxposed / LSPosed 入口类的
+  保留规则（`module.prop`、`assets/META-INF/xposed/*`、反射入口），属独立风险项 —— 需单独一轮验证，本轮不混入。
+
+#### F. 验证
+- `check-kt.sh` 双绿；花括号净值：LogScreenV1 107/107、LogStore 89/89、GlassSurface 8/8。
+- 全部调用点人工核查（`GlassTopAppBar` × 3、`glassSurface` × 2）。
+- **未编译**（与 `0a97d77` 同批，等 §0 门槛）。
+
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 
 - **工作流 1**：宿主冷启动前先启动目标 → 脚本应仍注入成功（`load_persisted_script src=remote_prefs`）；

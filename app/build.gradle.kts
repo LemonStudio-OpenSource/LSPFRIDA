@@ -23,8 +23,12 @@ android {
         versionName = "1.0"
 
         ndk {
-            // frida-gumjs devkit 提供 arm64 / arm 两套静态库；按需增减
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            // P0-1（2026-10-06）：仅 arm64-v8a —— 砍掉 32 位分支。
+            // 依据（APK 实测）：armeabi-v7a/libgumjs_bridge.so 压缩后仍占 27.19 MB，
+            // 为全包 87 MB 的 32%；而验证环境（小米 23013RK75C / Android 15）为 arm64，
+            // 32 位设备在 A15 时代已无实际目标 —— 纯负担。
+            // devkit 的 armeabi-v7a 目录**保留在源码树**（未删），需要时把 ABI 加回本行即可。
+            abiFilters += listOf("arm64-v8a")
         }
 
         externalNativeBuild {

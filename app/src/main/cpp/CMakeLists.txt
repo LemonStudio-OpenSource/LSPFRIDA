@@ -3,7 +3,8 @@ project(gumjsbridge CXX)
 
 # 预期目录结构：
 # cpp/frida-gumjs-devkit/arm64-v8a/{libfrida-gumjs.a, frida-gumjs.h}
-# cpp/frida-gumjs-devkit/armeabi-v7a/{libfrida-gumjs.a, frida-gumjs.h}
+# （P0-1 2026-10-06：abiFilters 已收敛为 arm64-v8a；devkit 的 armeabi-v7a 目录保留未删，
+#   需要 32 位时在 app/build.gradle.kts 的 abiFilters 中加回即可，本文件无需改动。）
 set(GUMJS_DEVKIT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/frida-gumjs-devkit)
 
 if(NOT EXISTS ${GUMJS_DEVKIT_DIR}/${ANDROID_ABI}/libfrida-gumjs.a)

@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(gumjsbridge CXX)
 
+# ⚠ 改本文件后若出现 `ninja: error: manifest 'build.ninja' still dirty after 100 tries`：
+#   原因 = CMake 生成 build.ninja 是 copy-if-different；**只改注释** → 生成内容逐字节相同
+#   → CMake 不写文件 → mtime 不更新 → ninja 永远 dirty（2026-10-06 实证：重配 100 次后失败）。
+#   解法 = 删掉 app/.cxx 让 CMake 全量重生成：`rm -rf app/.cxx`。
+#   注意：若本次改的是**语义**（源文件列表/编译选项），生成内容会变 → 正常写文件 → 不触发。
+
 # 预期目录结构：
 # cpp/frida-gumjs-devkit/arm64-v8a/{libfrida-gumjs.a, frida-gumjs.h}
 # （P0-1 2026-10-06：abiFilters 已收敛为 arm64-v8a；devkit 的 armeabi-v7a 目录保留未删，

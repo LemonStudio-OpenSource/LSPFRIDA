@@ -218,6 +218,7 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 ## K. 体积与性能（第十一轮 P0）—— 独立可验
 | # | 操作 | 预期 |
 |---|---|---|
+| K0 | **前置**：确认 `app/.cxx` 已删除后首次编译 | 不再出现 `ninja ... still dirty`；native 全量重建一次（较慢，正常） |
 | K1 | 查看 APK 内容 | **只有 `lib/arm64-v8a/`**，无 `lib/armeabi-v7a/` |
 | K2 | 记录 APK 体积 | 约 60 MB（原 87 MB，-27 MB） |
 | K3 | 日志页：脚本高频输出（engine poll 级）时观察 | 列表流畅追加；**不再卡顿**；日志仍"看起来实时"（≤200ms 延迟） |

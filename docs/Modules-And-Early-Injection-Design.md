@@ -659,6 +659,25 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 - R8/minifyEnabled：**无 `buildTypes` 块**是 17.67 MB dex 的根因，但开 R8 需处理 libxposed / LSPosed 入口类的
   保留规则（`module.prop`、`assets/META-INF/xposed/*`、反射入口），属独立风险项 —— 需单独一轮验证，本轮不混入。
 
+#### G. 编译阻塞：`ninja still dirty after 100 tries`（实测根因 + 处置）
+**症状**：`P0-1` 改动后编译失败，日志刷 100 次 `[0/N] Re-running CMake...` 后报
+`ninja: error: manifest 'build.ninja' still dirty after 100 tries, perhaps system time is not set`。
+
+**排查（先排除误判）**：
+- 时钟正常（无未来时间文件：扫描 `app/.cxx` 得"未来时间文件数 = 0"）。
+- 一度误判为"路径错位"（我在 Ubuntu sandbox 看不到 `/data/user/0/com.tom.rv2ide/...`，36/40 输入显示缺失）
+  —— **该判断错误**：ninja 实际运行在设备上，该路径是 RV2IDE 私有目录，设备侧存在。sandbox 视角不可作证据。
+
+**真根因（数据钉死）**：
+- `build.ninja` mtime = **Aug 25 11:23**；`CMakeLists.txt` mtime = **Oct 6 04:12**（+41 天）。
+- `build.ninja` 的 `RERUN_CMAKE` 边共 40 个输入，其中**唯一**"比 build.ninja 新"的就是 `CMakeLists.txt`。
+- 机制：CMake 生成 `build.ninja` 是 **copy-if-different**。P0-1 对该文件只改了**注释** →
+  生成内容与旧文件**逐字节相同** → CMake 不写文件 → mtime 不更新 → ninja 永远判定 dirty。
+
+**处置**：`rm -rf app/.cxx app/build/intermediates/{cxx,merged_native_libs,stripped_native_libs} app/build/outputs/apk`
+（`app/build` 548M → 87M；同时清掉旧 armeabi-v7a 残留产物，保证 P0-1 的 ABI 收敛真正生效）。
+**防复发**：`CMakeLists.txt` 顶部已加注释说明（改注释后如遇该错，删 `app/.cxx` 即可）。
+
 #### F. 验证
 - `check-kt.sh` 双绿；花括号净值：LogScreenV1 107/107、LogStore 89/89、GlassSurface 8/8。
 - 全部调用点人工核查（`GlassTopAppBar` × 3、`glassSurface` × 2）。

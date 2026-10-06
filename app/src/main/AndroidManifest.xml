@@ -26,7 +26,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="基于 Frida-GumJS 的动态调试与脚本注入工具" />
+            android:value="在 App 内直接跑 Frida 脚本 —— 不用 frida-server，不用连电脑" />
         <meta-data
             android:name="xposedminversion"
             android:value="82" />

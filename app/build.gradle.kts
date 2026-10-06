@@ -53,6 +53,36 @@ android {
         compose = true
     }
 
+    // P1（2026-10-06）：启用 R8 —— dex 体积从 17.67 MB 的根因是「无 buildTypes 块」。
+    // 第一性原理：dex 里绝大部分是未被直接引用的库代码（Compose/Miuix/sora-editor/tm4e）
+    // 的类与方法，R8 的 shrink（可达性分析）+ optimize（内联/类合并）+ obfuscate（重命名）
+    // 三者中，**shrink 是体积收益的主力**，obfuscate 只影响常量池里的标识符长度。
+    //
+    // 风险控制（依据实核，见 app/proguard-rules.pro 顶部注释）：
+    //   1. libxposed 入口按 META-INF/xposed/java_init.list 里的**硬编码字符串**反射加载
+    //   2. 6 个 JNI 方法名即 C 符号名（Java_com_bail_lspfrifa_xposed_GumJsBridge_nativeXxx）
+    //   3. AIDL 跨进程按接口全名 + 事务方法名通信，两侧混淆结果必须一致
+    //   以上三类已全部写入 keep 规则。
+    //
+    // 注意：本模块的 release 变体**不签名**（未配置 signingConfig）——
+    //       `assembleRelease` 产出 `app-release-unsigned.apk`，需手动签名或用 debug 变体验证。
+    //       若只想验证 R8 效果而不想处理签名，可临时用 `isMinifyEnabled = true` 打在 debug 上。
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+        }
+        // debug 保持不混淆：真机验证阶段需要可读栈 + 快速增量编译。
+        // R8 的效果只在 release 变体上体现（体积收益在发布包上看）。
+        debug {
+            isMinifyEnabled = false
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

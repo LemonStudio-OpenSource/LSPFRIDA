@@ -656,8 +656,8 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 
 #### E. 明确不做（本轮）
 - 导出符号裁剪（用户保留）。
-- R8/minifyEnabled：**无 `buildTypes` 块**是 17.67 MB dex 的根因，但开 R8 需处理 libxposed / LSPosed 入口类的
-  保留规则（`module.prop`、`assets/META-INF/xposed/*`、反射入口），属独立风险项 —— 需单独一轮验证，本轮不混入。
+- ~~R8/minifyEnabled~~ **【2026-10-06 第十二轮已完成】** —— 原记录："**无 `buildTypes` 块**是 17.67 MB dex 的根因，但开 R8 需处理 libxposed / LSPosed 入口类的保留规则（`module.prop`、`assets/META-INF/xposed/*`、反射入口），属独立风险项 —— 需单独一轮验证，本轮不混入。"
+  → 该独立轮已完成，见下方**第十二轮**（三类 keep 全部实核后落规则）。
 
 #### G. 编译阻塞：`ninja still dirty after 100 tries`（实测根因 + 处置）
 **症状**：`P0-1` 改动后编译失败，日志刷 100 次 `[0/N] Re-running CMake...` 后报
@@ -682,6 +682,102 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 - `check-kt.sh` 双绿；花括号净值：LogScreenV1 107/107、LogStore 89/89、GlassSurface 8/8。
 - 全部调用点人工核查（`GlassTopAppBar` × 3、`glassSurface` × 2）。
 - **未编译**（与 `0a97d77` 同批，等 §0 门槛）。
+
+### 第十二轮：R8 启用 + 仓库门面（2026-10-06）
+
+#### A. 触发与前置事实
+- 触发：第十一轮把 dex（17.67 MB / 占压缩包 30%）列为「独立风险项，不混入本轮」，
+  本轮专门处理它。同批完成仓库门面（LICENSE / Issue 模板）。
+- **前置**：用户侧已确认 `0a97d77`→`992b4ee` 全链**编译通过**。本轮改动为**纯构建配置 + 新增文件**，
+  不触碰任何 `.kt` 源码 → 编译风险集中在 proguard 规则正确性。
+
+#### B. 第一性原理：dex 里到底装了什么
+R8 的三项能力对体积的贡献**不等价**：
+
+| 能力 | 机制 | 体积收益 |
+|---|---|---|
+| **shrink** | 可达性分析，删除无引用的类/方法/字段 | **主力**（库代码大量未被直接引用） |
+| optimize | 内联、类合并、常量传播、死代码消除 | 中等 |
+| obfuscate | 标识符重命名为短名 | 次要（只缩短常量池字符串） |
+
+结论：**受益主要来自 shrink 而非混淆**——即"开 R8 会把用不到的东西删掉"，而非"改名字省空间"。
+
+#### C. 实核：R8 必须 keep 的三类（全部有据可查）
+
+**这是本轮唯一有真实风险的环节，逐条实测后写入规则：**
+
+| # | 类别 | 实核依据 | 不 keep 的后果 |
+|---|---|---|---|
+| 1 | **libxposed 模块入口** | APK 内 `META-INF/xposed/java_init.list` 的**内容是硬编码字符串**：`com.bail.lspfrifa.xposed.LSPFRIFAModule`<br>（`app/src/main/resources/META-INF/xposed/java_init.list`） | 框架反射找不到入口 → **模块完全失效**（连日志都没有） |
+| 2 | **JNI native 方法** | `app/src/main/cpp/*.cpp` 实现 6 个符号：<br>`Java_com_bail_lspfrifa_xposed_GumJsBridge_{nativeInitEngine,nativeSetCallback,nativeLoadScript,nativeUnloadScript,nativeCallJs,nativePostOriginalReply}`<br>（对应 `GumJsBridge.kt` 的 6 个 `external fun`） | JNI 静态注册按「类全名+方法名」拼符号 → `UnsatisfiedLinkError` → 引擎无法初始化 |
+| 3 | **AIDL 跨进程契约** | `app/src/main/aidl/com/bail/lspfrifa/ipc/{ILogReceiver,IScriptExecutor}.aidl`<br>目标进程与宿主进程**各自持有同一份接口** | 两侧混淆结果不同 → `TransactionTooLarge`/`UNKNOWN_TRANSACTION` 等诡异跨进程错误 |
+
+附带保留（低成本兜底，非必需）：Android 组件四类、Kotlin 注解属性、枚举 `values/valueOf`、
+`Parcelable.CREATOR`、sora-editor/tm4e/gson/snakeyaml（反射加载语法与主题）、
+`HookRouter.uninstallClassLoaderWatcher`（预留未调用 API，R8 会当死代码删掉）。
+
+#### D. 落地改动
+
+**`app/build.gradle.kts`** —— 新增 `buildTypes` 块（此前**完全没有**该块）：
+```kotlin
+buildTypes {
+    release {
+        isMinifyEnabled = true
+        isShrinkResources = true
+        proguardFiles(
+            getDefaultProguardFile("proguard-android-optimize.txt"),
+            "proguard-rules.pro",
+        )
+    }
+    debug { isMinifyEnabled = false }   // 真机验证期需要可读栈 + 快速增量
+}
+```
+
+**`app/proguard-rules.pro`** —— 从 AGP 模板（23 行注释）替换为 164 行实核规则，
+分 10 组，每条规则标注实核依据（文件:行号）。
+
+#### E. 明确不做（**用户裁定，不要动**）
+- **导出符号裁剪（用户保留，原话："那个导出符号先不管，万一以后有用呢"）** ——
+  `--exclude-libs,ALL` + version script 可再省 ~7 MB/ABI，但用户明确保留。
+  本轮实测确认**未触碰**：
+  ```
+  符号表总条目 63458 · 动态导出(FUNC GLOBAL) 30469 · frida__ZN 23095
+  .dynsym 1.45 MB · .dynstr 5.42 MB · .rodata 7.34 MB · .text 12.32 MB  → 与 P0 基线一致
+  CMakeLists.txt 中 exclude-libs/version-script/strip/visibility 命中数 = 0（git diff 亦为空）
+  ```
+  **R8 的作用域仅限 dex，物理上够不到 `.so`** —— 两者是不同层面，互不影响。
+
+#### F. 验证
+- proguard 规则：全文花括号净值 24/24；逐行深度检查负深度=0；6 条关键规则存在性逐条命中。
+- **双向验证**：植入 `-keep class com.bad.test {`（缺闭括号）→ 25/24 能发现；
+  恢复后 24/24 → 不误报。
+- 8 个 keep 类名与源码路径**逐条比对一致**（LSPFRIFAModule / GumJsBridge / LSPFRIFAApplication /
+  MainActivity / ScriptConfigProvider / ScriptStore / EarlyLogBuffer / HookRouter）。
+- `check-kt.sh` 双绿（本轮未动 Kotlin，属回归确认）。
+- **未编译**：R8 规则的正确性最终要由 `assembleRelease` 验证（见 Checklist §L）。
+
+#### G. 仓库门面（同批完成，无代码风险）
+- **`LICENSE`**：GPL-3.0 全文 674 行（标准行数）。
+  取材过程中两个源**均不完整**，已如实记录：
+  | 源 | 问题 |
+  |---|---|
+  | `gnu.org/licenses/gpl-3.0.txt` | 网络被阻（SSL_ERROR_SYSCALL） |
+  | choosealicense 版（**首取**） | 带 YAML frontmatter（37 行），剥除后**正文仅 553 行**，缺 `Copyright (C) 2007 Free Software Foundation, Inc.` |
+  | SPDX 版 | **仅 232 行**，同样缺该行 |
+  | **最终采用** | choosealicense 原始版剥 frontmatter 后 **674 行**，9 项关键锚点全命中 |
+- **`.github/ISSUE_TEMPLATE/`**：`bug_report.yml` + `feature_request.yml`。
+  bug 模板强制附日志（对应 Checklist §F 的回传格式）；feature 模板显式列出**已暂缓方向**（模块化拼装 /
+  符号裁剪 / 深度 VM API）减少无效 issue。
+
+#### H. 已知未验证项
+1. **R8 规则未经真实构建**：`assembleRelease` 是唯一验收手段。
+   若出现 `Missing class` 告警需补 `-dontwarn`；若运行时崩溃，优先怀疑
+   入口类/JNI/AIDL 三类的 keep 不足（可临时 `-keep class com.bail.lspfrifa.** { *; }` 二分定位）。
+2. **release 变体未签名**：产出 `app-release-unsigned.apk`，需手动签名；
+   或临时把 `isMinifyEnabled = true` 打在 debug 上验证（会牺牲增量编译速度）。
+3. **依赖库自带 consumer 规则未实核**：sandbox 无 Gradle 缓存，
+   `sora-editor`/`tm4e`/`miuix` 的 consumer proguard 内容无法查证——
+   本轮按"保守 superset"策略多留了规则（过度 keep 只影响体积收益，不影响正确性）。
 
 ## 6. 验证清单（每工作流交付后由用户侧执行）
 
@@ -752,4 +848,3 @@ commit `f069e7f`（5 文件 +347/-1）。解决了设计之初就登记的硬限
 - 工作流 4：类加载感知
 - ~~分享入口（`ACTION_SEND` intent-filter）~~ ✅ 本第二轮已闭环（PendingImport + ImportTargetScreen + Manifest + 路由）
 - **实测回填**：D5 的四个尺寸阈值（200KB/500KB/900KB/1.2MB）需用户侧真机验证
-

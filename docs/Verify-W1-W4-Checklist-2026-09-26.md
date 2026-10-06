@@ -227,3 +227,28 @@ sh gradlew --no-daemon :app:assembleDebug   # 复核用；增量应秒级
 | K6 | 日志页清除后继续有新日志 | 不自动回灌（cleared 防护） |
 | K7 | 日志页进入时已有历史 + 实时正在输出 | 顺序正确（历史在前、实时在后），无错位 |
 | K8 | 回归：详情页/编辑页顶栏玻璃效果 | 与之前一致（blurEnabled 默认 true，零回归） |
+
+## L. R8 与仓库门面（第十二轮）—— 独立可验
+> **前置**：`assembleRelease` 必须先过。R8 规则的错误**只会在构建期或首次运行时暴露**，
+> 静态检查无法覆盖（本项目已有三次「静态双绿 ≠ 可编译」的教训）。
+
+| # | 操作 | 预期 |
+|---|---|---|
+| L1 | `./gradlew :app:assembleRelease` | `BUILD SUCCESSFUL`；产出 `app-release-unsigned.apk`。**警告可容忍，`Missing class` 报错不可** |
+| L2 | 记录 release APK 体积（含 `.so` 对照） | dex 应从 **17.67 MB** 显著下降（预期 -30%~-50%）；`.so` **必须仍是 37.94 MB 且符号未变**（R8 不作用于 native） |
+| L3 | **符号保留复验**（防误裁） | `readelf --dyn-syms` 计数：动态导出 **30469**、`frida__ZN` **23095**、符号表 **63458** —— 与 debug 包**完全一致** |
+| L4 | 签名并安装 release 包 | 签名后 `adb install` 成功（或直接用 debug 变体验证 R8 以外行为） |
+| L5 | **入口类存活**（最关键） | LSPosed 中启用模块 → 打开目标应用 → **必须出现注入日志**（`[lsp-hook] ARMED`）。若日志完全空白 → 入口类被混淆（`LSPFRIFAModule` keep 失效） |
+| L6 | **JNI 链路存活** | 脚本能正常执行（引擎初始化成功）→ 证明 6 个 `nativeXxx` 方法名未被混淆。若 `UnsatisfiedLinkError` → keep 规则 [2] 失效 |
+| L7 | **AIDL 链路存活** | 目标进程日志能实时回到宿主 UI → 证明 `ILogReceiver` 契约未变。若宿主收不到日志但目标侧有输出 → keep 规则 [4] 失效 |
+| L8 | 编辑器语法高亮回归 | 打开脚本编辑器 → JS 高亮正常（tm4e/gson/snakeyaml 反射未被破坏）。若高亮消失但不崩溃 → keep 规则 [7] 需补充 |
+| L9 | **资源收缩复验** | release APK 内 `resources.arsc` 与 assets 无缺失；`assets/textmate/*` **必须完整**（若缺失则 `isShrinkResources` 误删，需在 `keep.xml` 白名单） |
+| L10 | 已知风险二分法（仅当 L5–L7 失败时用） | 临时加 `-keep class com.bail.lspfrifa.** { *; }` 重编 → 若恢复正常，再逐组注释定位是 [1]/[2]/[4] 哪一组 |
+
+### L-a 仓库门面（无需真机）
+| # | 操作 | 预期 |
+|---|---|---|
+| L11 | GitHub 仓库页侧边栏 | 出现 **GPL-3.0 license 徽章**（LICENSE 文件已推送后生效） |
+| L12 | 新建 Issue 页 | 出现 **两种模板选择**（🐛 Bug 反馈 / ✨ 功能建议） |
+| L13 | 打 `v1.0` tag 并创建 Release | Release 页出现；README 的「从 Releases 下载」链接生效（当前 `releases: 0` 是空链接） |
+

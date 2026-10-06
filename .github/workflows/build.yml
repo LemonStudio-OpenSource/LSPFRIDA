@@ -7,16 +7,16 @@ on:
   pull_request:
   workflow_dispatch:
 
-# 同一分支/PR 只保留最新一次构建，避免 devkit 331MB 重复下载
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   FRIDA_VERSION: '17.9.3'
-  NDK_VERSION: '28.2.13676358'   # 若 build.gradle.kts 的 ndkVersion 不同，改这里
+  NDK_VERSION: '28.2.13676358'     # 必须与 build.gradle.kts 里的 ndkVersion 一致
   BUILD_TOOLS: '36.0.0'
   ANDROID_PLATFORM: '36'
+  CMAKE_VERSION: '3.22.1'
 
 jobs:
   build:
@@ -34,17 +34,42 @@ jobs:
           java-version: '17'
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK / build-tools / CMake
+      # 不再使用 android-actions/setup-android@v3（会在 cmdline-tools 16.0 下尝试装 'tools' 而失败）
+      - name: Configure Android SDK (use preinstalled)
         run: |
-          sdkmanager --install \
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK not found at $SDK_ROOT"
+            exit 1
+          fi
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> $GITHUB_ENV
+          echo "ANDROID_HOME=$SDK_ROOT"     >> $GITHUB_ENV
+
+          # 找到可用的 sdkmanager（优先 cmdline-tools/latest，其次 PATH）
+          if [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMGR="$(command -v sdkmanager)"
+          fi
+          echo "Using sdkmanager: $SDKMGR"
+          echo "SDKMGR=$SDKMGR" >> $GITHUB_ENV
+
+      - name: Install NDK / build-tools / CMake / platform
+        run: |
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" --install \
             "ndk;${NDK_VERSION}" \
             "build-tools;${BUILD_TOOLS}" \
             "platforms;android-${ANDROID_PLATFORM}" \
-            "cmake;3.22.1"
+            "cmake;${CMAKE_VERSION}"
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> $GITHUB_ENV
+
+      - name: Verify toolchain
+        run: |
+          ls -d "$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}"
+          ls -d "$ANDROID_SDK_ROOT/build-tools/${BUILD_TOOLS}"
+          ls -d "$ANDROID_SDK_ROOT/cmake/${CMAKE_VERSION}" || true
 
       - name: Cache Frida GumJS devkit
         id: cache-frida
@@ -59,12 +84,12 @@ jobs:
           mkdir -p app/src/main/cpp/frida-gumjs-devkit/arm64-v8a
           URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-gumjs-devkit-${FRIDA_VERSION}-android-arm64.tar.xz"
           echo "Downloading $URL"
-          wget --tries=3 --timeout=60 -q "$URL" -O /tmp/gumjs.tar.xz
+          wget --tries=3 --timeout=120 -q "$URL" -O /tmp/gumjs.tar.xz
           tar -xf /tmp/gumjs.tar.xz -C app/src/main/cpp/frida-gumjs-devkit/arm64-v8a
           rm -f /tmp/gumjs.tar.xz
           ls -la app/src/main/cpp/frida-gumjs-devkit/arm64-v8a
 
-      - name: Grant execute permission for gradlew
+      - name: Make gradlew executable
         run: chmod +x ./gradlew
 
       - name: Build Debug APK
@@ -76,9 +101,7 @@ jobs:
 
       - name: Prepare artifact name
         id: meta
-        run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          echo "suffix=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        run: echo "suffix=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
       - name: Upload APKs
         uses: actions/upload-artifact@v4
@@ -89,7 +112,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # 打 tag 时自动发 Release（Release APK 未签名，仅作分发用，需要签名请自备 keystore）
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
